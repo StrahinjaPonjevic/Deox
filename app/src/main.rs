@@ -189,7 +189,7 @@ impl DeoxApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let idle = self.phase == Phase::Idle;
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Folder or drive:");
             let field = ui.add_enabled(
                 idle,
@@ -306,54 +306,96 @@ impl DeoxApp {
 
         let row_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + ui.spacing().item_spacing.y * 2.0;
         let mut toggled = None;
+        let mut category_select: Option<(Category, bool)> = None;
         let mut uninstall = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_height, self.rows.len(), |ui, range| {
             for row in &self.rows[range] {
                 match row {
                     Row::Header { category, total, count } => {
-                        let arrow = if self.collapsed.contains(category) { "▶" } else { "▼" };
-                        let text = format!("{arrow} {}  ·  {count} items  ·  {}", category_name(*category), human(*total));
-                        if ui.add(egui::Button::new(RichText::new(text).strong()).frame(false)).clicked() {
-                            toggled = Some(*category);
-                        }
+                        let (chosen, selectable) = results
+                            .report
+                            .findings
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, f)| f.category == *category && f.confidence != Confidence::Info)
+                            .fold((0, 0), |(c, t), (i, _)| (c + usize::from(self.selected.contains(&i)), t + 1));
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(row_height);
+                            if selectable > 0 {
+                                let mut on = chosen == selectable;
+                                let partial = chosen > 0 && chosen < selectable;
+                                let check = ui.add(egui::Checkbox::new(&mut on, "").indeterminate(partial));
+                                if check.changed() {
+                                    category_select = Some((*category, on));
+                                }
+                                check.on_hover_text("Select or clear every item in this group");
+                            } else {
+                                ui.add_space(CHECK_W);
+                            }
+                            let arrow = if self.collapsed.contains(category) { "▶" } else { "▼" };
+                            let text = format!("{arrow} {}  ·  {}  ·  {}", category_name(*category), items(*count), human(*total));
+                            if ui.add(egui::Button::new(RichText::new(text).strong()).frame(false)).clicked() {
+                                toggled = Some(*category);
+                            }
+                        });
                     }
                     Row::Item(i) => {
                         let finding = &results.report.findings[*i];
+                        let (name, parent) = if finding.path.as_os_str().is_empty() {
+                            (finding.rule.clone(), String::new())
+                        } else {
+                            let name = finding.path.file_name().map_or_else(|| finding.path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                            (name, finding.path.parent().map(|p| p.display().to_string()).unwrap_or_default())
+                        };
+                        let full_path = finding.path.display().to_string();
                         ui.horizontal(|ui| {
-                            ui.add_space(18.0);
-                            if finding.confidence == Confidence::Info {
-                                ui.add_space(24.0);
-                            } else {
-                                let mut on = self.selected.contains(i);
-                                if ui.checkbox(&mut on, "").changed() {
-                                    if on {
-                                        self.selected.insert(*i);
-                                    } else {
-                                        self.selected.remove(i);
+                            ui.add_space(ITEM_INDENT);
+                            cell(ui, CHECK_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                if finding.confidence != Confidence::Info {
+                                    let mut on = self.selected.contains(i);
+                                    if ui.checkbox(&mut on, "").changed() {
+                                        if on {
+                                            self.selected.insert(*i);
+                                        } else {
+                                            self.selected.remove(i);
+                                        }
                                     }
                                 }
-                            }
+                            });
                             let (tag, color) = confidence_tag(finding.confidence);
-                            ui.label(RichText::new(tag).color(color).strong());
-                            ui.label(RichText::new(human(finding.size)).monospace());
-                            let title = if finding.path.as_os_str().is_empty() {
-                                finding.rule.clone()
-                            } else {
-                                finding.path.display().to_string()
-                            };
-                            ui.add(egui::Label::new(title).truncate());
+                            cell(ui, TAG_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(tag).color(color).strong());
+                            });
+                            cell(ui, SIZE_W, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(human(finding.size)).monospace());
+                            });
+                            let title = ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
+                            if !parent.is_empty() {
+                                ui.add(egui::Label::new(RichText::new(parent).weak()).truncate()).on_hover_text(&full_path);
+                                title.on_hover_text(&full_path);
+                            }
                             if finding.confidence == Confidence::Info && finding.uninstall.is_some() && ui.button("Uninstall…").clicked() {
                                 uninstall = Some(*i);
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.add_space(60.0);
-                            ui.add(egui::Label::new(RichText::new(&finding.reason).weak()).truncate());
+                            // Lines up under the name column of the row above.
+                            ui.add_space(ITEM_INDENT + CHECK_W + TAG_W + SIZE_W + ui.spacing().item_spacing.x * 3.0);
+                            ui.add(egui::Label::new(RichText::new(&finding.reason).weak()).truncate()).on_hover_text(&finding.reason);
                         });
                     }
                 }
             }
         });
+        if let (Some((category, on)), Some(results)) = (category_select, &self.results) {
+            for (i, _) in results.report.findings.iter().enumerate().filter(|(_, f)| f.category == category && f.confidence != Confidence::Info) {
+                if on {
+                    self.selected.insert(i);
+                } else {
+                    self.selected.remove(&i);
+                }
+            }
+        }
         if let Some(category) = toggled {
             if !self.collapsed.remove(&category) {
                 self.collapsed.insert(category);
@@ -555,6 +597,20 @@ fn describe(outcome: &Outcome) -> String {
         Outcome::Changed => "Changed since the scan".into(),
         Outcome::Failed(why) => format!("Failed: {why}"),
     }
+}
+
+const CHECK_W: f32 = 24.0;
+const TAG_W: f32 = 52.0;
+const SIZE_W: f32 = 76.0;
+const ITEM_INDENT: f32 = 18.0;
+
+/// A fixed-width table cell, so tags and sizes line up down the list.
+fn cell(ui: &mut egui::Ui, width: f32, layout: egui::Layout, add: impl FnOnce(&mut egui::Ui)) {
+    let size = egui::vec2(width, ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(size, layout, |ui| {
+        ui.set_width(width);
+        add(ui);
+    });
 }
 
 fn items(n: usize) -> String {

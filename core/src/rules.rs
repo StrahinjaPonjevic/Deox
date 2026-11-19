@@ -151,6 +151,7 @@ fn finding(rule: &Rule, path: PathBuf, size: u64) -> Finding {
         confidence: rule.confidence,
         rule: rule.name.clone(),
         reason: rule.reason.clone(),
+        uninstall: None,
     }
 }
 

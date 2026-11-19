@@ -30,4 +30,6 @@ pub struct Finding {
     pub confidence: Confidence,
     pub rule: String,
     pub reason: String,
+    /// For installed programs: the command that starts their own uninstaller.
+    pub uninstall: Option<String>,
 }

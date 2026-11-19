@@ -1,0 +1,20 @@
+# Programs worth a second look. Deox only reports them; removal is always through
+# the program's own uninstaller. Matching is a case-insensitive substring of the
+# program name or publisher. Keep this list short and conservative: every entry
+# must have a reason the user can read and judge.
+
+[[rule]]
+name = "Trial security suite"
+name_contains = ["McAfee", "Norton"]
+reason = "Security suite that often comes preinstalled as a trial; Windows Security already protects the PC."
+
+[[rule]]
+name = "Preinstalled games bundle"
+name_contains = ["WildTangent"]
+publisher_contains = ["WildTangent"]
+reason = "Game portal that PC makers preinstall; rarely chosen by the user."
+
+[[rule]]
+name = "End-of-life software"
+name_contains = ["Adobe Flash Player"]
+reason = "Discontinued in 2020 and no longer receives security updates."

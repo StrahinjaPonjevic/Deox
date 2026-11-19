@@ -65,6 +65,7 @@ impl DupeGroup {
                 confidence: Confidence::Review,
                 rule: "Duplicate files".to_string(),
                 reason: format!("Identical content to {}", kept.display()),
+                uninstall: None,
             })
             .collect()
     }

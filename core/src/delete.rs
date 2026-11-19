@@ -68,32 +68,105 @@ pub fn default_log_path() -> Option<PathBuf> {
 /// (time, result, size, path). With `dry_run` nothing is touched and nothing is logged.
 /// If the log cannot be opened or written, deletion stops: no action goes unrecorded.
 pub fn delete(findings: &[Finding], dry_run: bool, log: &Path) -> Result<DeleteReport> {
-    let mut log_file = if dry_run { None } else { Some(open_log(log)?) };
-    let mut report = DeleteReport::default();
-    for finding in findings {
-        let outcome = attempt(finding, dry_run);
-        if let Some(file) = log_file.as_mut() {
-            let line = format!("{}\t{}\t{}\t{}\n", timestamp(), outcome.label(), finding.size, finding.path.display());
-            file.write_all(line.as_bytes()).context("cannot write the action log")?;
-        }
-        report.entries.push(DeleteEntry { path: finding.path.clone(), size: finding.size, outcome });
-    }
-    Ok(report)
+    delete_with_progress(findings, dry_run, log, &|_, _| {})
 }
 
-fn attempt(finding: &Finding, dry_run: bool) -> Outcome {
+/// Items handed to the Recycle Bin in one system call. One call per item costs tens of
+/// milliseconds each, which adds up to many minutes for thousands of small cache files.
+const TRASH_BATCH: usize = 200;
+
+/// Like [`delete`], and calls `progress(done, total)` as items are settled.
+pub fn delete_with_progress(
+    findings: &[Finding],
+    dry_run: bool,
+    log: &Path,
+    progress: &dyn Fn(usize, usize),
+) -> Result<DeleteReport> {
+    let mut log_file = if dry_run { None } else { Some(open_log(log)?) };
+    let total = findings.len();
+    let mut outcomes: Vec<Option<Outcome>> = vec![None; total];
+    let mut done = 0;
+    let mut pending: Vec<usize> = Vec::new();
+
+    // The log keeps the order of the selection, even though items are settled in batches.
+    let mut logged = 0;
+    let mut settle = |i: usize, outcome: Outcome, outcomes: &mut Vec<Option<Outcome>>| -> Result<()> {
+        outcomes[i] = Some(outcome);
+        done += 1;
+        if let Some(file) = log_file.as_mut() {
+            while let Some(Some(outcome)) = outcomes.get(logged) {
+                let finding = &findings[logged];
+                let line = format!("{}\t{}\t{}\t{}\n", timestamp(), outcome.label(), finding.size, finding.path.display());
+                file.write_all(line.as_bytes()).context("cannot write the action log")?;
+                logged += 1;
+            }
+        }
+        progress(done, total);
+        Ok(())
+    };
+
+    for (i, finding) in findings.iter().enumerate() {
+        match check(finding, dry_run) {
+            Err(outcome) => settle(i, outcome, &mut outcomes)?,
+            Ok(()) => pending.push(i),
+        }
+        if pending.len() >= TRASH_BATCH {
+            for (j, outcome) in trash_batch(findings, &std::mem::take(&mut pending)) {
+                settle(j, outcome, &mut outcomes)?;
+            }
+        }
+    }
+    for (j, outcome) in trash_batch(findings, &pending) {
+        settle(j, outcome, &mut outcomes)?;
+    }
+
+    let entries = findings
+        .iter()
+        .zip(outcomes)
+        .map(|(f, outcome)| DeleteEntry { path: f.path.clone(), size: f.size, outcome: outcome.unwrap_or(Outcome::Missing) })
+        .collect();
+    Ok(DeleteReport { entries })
+}
+
+/// Moves the items in one call. If the system rejects the batch, each item is tried alone so
+/// that one locked file does not hide what happened to the others.
+fn trash_batch(findings: &[Finding], indices: &[usize]) -> Vec<(usize, Outcome)> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    let paths: Vec<&Path> = indices.iter().map(|&i| findings[i].path.as_path()).collect();
+    if trash::delete_all(&paths).is_ok() {
+        return indices.iter().map(|&i| (i, Outcome::Deleted)).collect();
+    }
+    indices
+        .iter()
+        .map(|&i| {
+            let path = &findings[i].path;
+            let outcome = match trash::delete(path) {
+                Ok(()) => Outcome::Deleted,
+                // Gone now although it passed the check: the failed batch had already moved it.
+                Err(_) if fs::symlink_metadata(path).is_err() => Outcome::Deleted,
+                Err(e) => Outcome::Failed(e.to_string()),
+            };
+            (i, outcome)
+        })
+        .collect()
+}
+
+/// `Err` carries the final outcome of an item that must not be moved (or, in a dry run, can be).
+fn check(finding: &Finding, dry_run: bool) -> std::result::Result<(), Outcome> {
     if finding.confidence == Confidence::Info || finding.category == Category::Bloatware {
-        return Outcome::NotDeletable;
+        return Err(Outcome::NotDeletable);
     }
     let path = &finding.path;
     // Checked before touching the disk, so a protected path is refused even if it is gone.
     if path.as_os_str().is_empty() || is_protected(path) {
-        return Outcome::Protected;
+        return Err(Outcome::Protected);
     }
-    let Ok(meta) = fs::symlink_metadata(path) else { return Outcome::Missing };
+    let Ok(meta) = fs::symlink_metadata(path) else { return Err(Outcome::Missing) };
     // Links and junctions are never followed or removed (Rust reports both as symlinks).
     if meta.file_type().is_symlink() {
-        return Outcome::Changed;
+        return Err(Outcome::Changed);
     }
     let unchanged = if meta.is_dir() {
         dir_size(path) == Some(finding.size)
@@ -101,15 +174,12 @@ fn attempt(finding: &Finding, dry_run: bool) -> Outcome {
         meta.len() == finding.size && meta.modified().ok() == finding.modified
     };
     if !unchanged {
-        return Outcome::Changed;
+        return Err(Outcome::Changed);
     }
     if dry_run {
-        return Outcome::WouldDelete;
+        return Err(Outcome::WouldDelete);
     }
-    match trash::delete(path) {
-        Ok(()) => Outcome::Deleted,
-        Err(e) => Outcome::Failed(e.to_string()),
-    }
+    Ok(())
 }
 
 /// Total size of regular files below `dir`, skipping links as the scanner does.

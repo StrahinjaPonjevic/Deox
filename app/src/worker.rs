@@ -1,6 +1,6 @@
 //! Background jobs, so the window stays responsive. Results come back as messages.
 
-use deox_core::delete::{default_log_path, delete, DeleteReport};
+use deox_core::delete::{default_log_path, delete_with_progress, DeleteReport};
 use eframe::egui;
 use deox_core::dupes::find_duplicates;
 use deox_core::programs::{installed_programs, AppxRegistry, BloatwareList, WindowsRegistry};
@@ -26,6 +26,8 @@ pub struct Analysis {
 pub enum Msg {
     Status(String),
     Progress(u64),
+    /// Items settled so far and the total, while moving to the Recycle Bin.
+    Moved(usize, usize),
     Analysis(Analysis),
     Deleted(DeleteReport),
     Failed(String),
@@ -71,7 +73,13 @@ pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, notify: Notifier) {
         let Some(log) = default_log_path() else {
             return notify.send(Msg::Failed("Deox can't find a folder for its action log, so nothing was moved.".into()));
         };
-        match delete(&findings, dry_run, &log) {
+        let report_progress = |done: usize, total: usize| {
+            // Thousands of small items would otherwise flood the window with messages.
+            if done == total || done % 25 == 0 {
+                notify.send(Msg::Moved(done, total));
+            }
+        };
+        match delete_with_progress(&findings, dry_run, &log, &report_progress) {
             Ok(report) => notify.send(Msg::Deleted(report)),
             Err(e) => notify.send(Msg::Failed(format!(
                 "The move could not finish: {e:#}\nSome items may already be in the Recycle Bin. Scan again to refresh the list."

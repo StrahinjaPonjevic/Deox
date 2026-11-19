@@ -45,9 +45,13 @@ struct DeoxApp {
     cancel: Arc<Cancel>,
     phase: Phase,
     root: String,
+    /// The folder the running scan was started on; the input field may change meanwhile.
+    scan_root: String,
     drives: Vec<String>,
     status: String,
     files_seen: u64,
+    /// Items settled and total while a move or check is running.
+    move_progress: (usize, usize),
     results: Option<Results>,
     rows: Vec<Row>,
     collapsed: HashSet<Category>,
@@ -70,9 +74,11 @@ impl DeoxApp {
             cancel: Arc::new(Cancel::default()),
             phase: Phase::Idle,
             root: String::new(),
+            scan_root: String::new(),
             drives,
             status: String::new(),
             files_seen: 0,
+            move_progress: (0, 0),
             results: None,
             rows: Vec::new(),
             collapsed: HashSet::new(),
@@ -104,6 +110,7 @@ impl DeoxApp {
             ));
             return;
         }
+        self.scan_root = root.display().to_string();
         self.cancel = Arc::new(Cancel::default());
         self.phase = Phase::Scanning;
         self.files_seen = 0;
@@ -112,6 +119,13 @@ impl DeoxApp {
         self.rows.clear();
         self.selected.clear();
         worker::spawn_analysis(root, self.cancel.clone(), self.notifier());
+    }
+
+    fn begin_delete(&mut self, findings: Vec<Finding>, dry_run: bool) {
+        self.phase = Phase::Deleting;
+        self.move_progress = (0, findings.len());
+        self.status = if dry_run { "Checking the selected items…".into() } else { "Moving the selected items to the Recycle Bin…".into() };
+        worker::spawn_delete(findings, dry_run, self.notifier());
     }
 
     fn set_results(&mut self, findings: Vec<Finding>, files: u64, unreadable: usize) {
@@ -141,6 +155,7 @@ impl DeoxApp {
         match msg {
             Msg::Status(s) => self.status = s,
             Msg::Progress(n) => self.files_seen = n,
+            Msg::Moved(done, total) => self.move_progress = (done, total),
             Msg::Analysis(a) => {
                 self.phase = Phase::Idle;
                 self.files_seen = a.files;
@@ -276,7 +291,18 @@ impl DeoxApp {
                 ui.add_space(8.0);
                 ui.label(&self.status);
                 if self.phase == Phase::Scanning {
+                    ui.label(RichText::new(&self.scan_root).weak());
                     ui.label(format!("{} files checked so far", self.files_seen));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Large drives can take several minutes. You can cancel at any time.").weak());
+                } else {
+                    let (done, total) = self.move_progress;
+                    if total > 0 {
+                        ui.add_space(8.0);
+                        ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0).text(format!("{done} of {total}")));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Many small files take a few minutes. Please keep Deox open.").weak());
+                    }
                 }
             });
             return;
@@ -284,7 +310,28 @@ impl DeoxApp {
         let Some(results) = &self.results else {
             ui.add_space(20.0);
             ui.heading("Find what is taking space");
-            ui.label("Choose a folder or a drive and press Scan.");
+            ui.label("Pick a folder or a drive above, then press Scan. Your user folder is a good place to start.");
+            if let Some(home) = std::env::var_os("USERPROFILE").filter(|h| PathBuf::from(h).is_dir()) {
+                ui.add_space(8.0);
+                if ui.button("Scan my user folder").clicked() {
+                    self.root = PathBuf::from(home).display().to_string();
+                    self.start_scan();
+                    return;
+                }
+            }
+            ui.add_space(16.0);
+            ui.label(RichText::new("Each suggestion carries a safety level").strong());
+            let dark = ui.visuals().dark_mode;
+            for level in [Confidence::Safe, Confidence::Review, Confidence::Info] {
+                let (tag, color, meaning) = confidence_tag(level, dark);
+                ui.horizontal(|ui| {
+                    cell(ui, TAG_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(tag).color(color).strong());
+                    });
+                    ui.label(meaning);
+                });
+            }
+            ui.add_space(16.0);
             ui.label("Deox only suggests. Nothing is removed without your confirmation, and removed items go to the Recycle Bin.");
             if !self.status.is_empty() {
                 ui.add_space(8.0);
@@ -457,9 +504,7 @@ impl DeoxApp {
             });
             if run {
                 self.confirm_delete = false;
-                self.phase = Phase::Deleting;
-                self.status = if self.dry_run { "Checking the selected items…".into() } else { "Moving the selected items to the Recycle Bin…".into() };
-                worker::spawn_delete(findings, self.dry_run, self.notifier());
+                self.begin_delete(findings, self.dry_run);
             } else if cancel || escape {
                 self.confirm_delete = false;
             }
@@ -506,9 +551,7 @@ impl DeoxApp {
             if move_now {
                 self.last_delete = None;
                 self.dry_run = false;
-                self.phase = Phase::Deleting;
-                self.status = "Moving the selected items to the Recycle Bin…".into();
-                worker::spawn_delete(self.selected_findings(), false, self.notifier());
+                self.begin_delete(self.selected_findings(), false);
             } else if close || escape {
                 self.last_delete = None;
             }

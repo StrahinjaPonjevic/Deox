@@ -230,6 +230,7 @@ impl DeoxApp {
         let Some(results) = &self.results else { return };
         let selected_size: u64 = self.selected.iter().filter_map(|i| results.report.findings.get(*i)).map(|f| f.size).sum();
         let idle = self.phase == Phase::Idle;
+        let (removable_count, removable_size) = removable(&results.report);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.add_enabled(idle, egui::Button::new("Select all Safe")).clicked() {
@@ -249,9 +250,9 @@ impl DeoxApp {
             ui.label(format!(
                 "{} of {} selected · {} of {}",
                 self.selected.len(),
-                results.report.findings.len(),
+                removable_count,
                 human(selected_size),
-                human(results.report.total_size()),
+                human(removable_size),
             ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let none_selected = self.selected.is_empty();
@@ -292,15 +293,28 @@ impl DeoxApp {
             return;
         };
 
-        ui.label(format!(
-            "Scanned {} files. Found {} you could clean up.{}",
-            results.files,
-            items(results.report.findings.len()),
-            if results.unreadable > 0 { format!(" {} couldn't be read and were left out.", paths(results.unreadable)) } else { String::new() },
-        ));
-        if results.report.findings.is_empty() {
+        let (removable_count, removable_size) = removable(&results.report);
+        if removable_count == 0 {
+            ui.label(format!("Scanned {} files.", results.files));
             ui.add_space(8.0);
             ui.label("Nothing to clean up here. Try another folder or a whole drive.");
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(human(removable_size)).size(34.0).strong());
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("could be freed").strong());
+                    ui.label(
+                        RichText::new(format!(
+                            "{} found in {} scanned files.{}",
+                            items(removable_count),
+                            results.files,
+                            if results.unreadable > 0 { format!(" {} couldn't be read.", paths(results.unreadable)) } else { String::new() },
+                        ))
+                        .weak(),
+                    );
+                });
+            });
         }
         ui.separator();
 
@@ -338,6 +352,9 @@ impl DeoxApp {
                             let text = format!("{arrow} {}  ·  {}  ·  {}", category_name(*category), items(*count), human(*total));
                             if ui.add(egui::Button::new(RichText::new(text).strong()).frame(false)).clicked() {
                                 toggled = Some(*category);
+                            }
+                            if selectable > 0 {
+                                share_bar(ui, *total, removable_size.max(1));
                             }
                         });
                     }
@@ -619,6 +636,22 @@ fn describe(outcome: &Outcome) -> String {
         Outcome::Changed => "Changed since the scan".into(),
         Outcome::Failed(why) => format!("Failed: {why}"),
     }
+}
+
+/// Count and size of the findings Deox can actually move; installed programs are only reported.
+fn removable(report: &Report) -> (usize, u64) {
+    report.findings.iter().filter(|f| f.confidence != Confidence::Info).fold((0, 0), |(n, s), f| (n + 1, s + f.size))
+}
+
+/// A thin bar showing a group's share of everything that could be freed.
+fn share_bar(ui: &mut egui::Ui, part: u64, whole: u64) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(120.0, 6.0), egui::Sense::hover());
+    let share = (part as f32 / whole as f32).clamp(0.0, 1.0);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * share, rect.height()));
+    painter.rect_filled(fill, 3.0, ui.visuals().selection.bg_fill);
+    response.on_hover_text(format!("{:.0}% of what could be freed", share * 100.0));
 }
 
 const CHECK_W: f32 = 24.0;

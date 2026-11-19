@@ -60,7 +60,7 @@ pub fn spawn_analysis(root: PathBuf, cancel: Arc<Cancel>, notify: Notifier) {
 pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, notify: Notifier) {
     std::thread::spawn(move || {
         let Some(log) = default_log_path() else {
-            return notify.send(Msg::Failed("Cannot locate a folder for the action log.".into()));
+            return notify.send(Msg::Failed("Deox can't find a folder for its action log, so nothing was moved.".into()));
         };
         match delete(&findings, dry_run, &log) {
             Ok(report) => notify.send(Msg::Deleted(report)),

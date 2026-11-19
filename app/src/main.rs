@@ -97,13 +97,16 @@ impl DeoxApp {
         }
         let root = PathBuf::from(root);
         if !root.is_dir() {
-            self.error = Some(format!("\"{}\" is not a folder or drive that can be scanned.", root.display()));
+            self.error = Some(format!(
+                "\"{}\" is not a folder or drive. Enter a path such as C:\\Users\\you, or choose one with Browse.",
+                root.display()
+            ));
             return;
         }
         self.cancel = Arc::new(Cancel::default());
         self.phase = Phase::Scanning;
         self.files_seen = 0;
-        self.status = "Starting…".into();
+        self.status = "Starting scan…".into();
         self.results = None;
         self.rows.clear();
         self.selected.clear();
@@ -240,14 +243,19 @@ impl DeoxApp {
             }
             ui.separator();
             ui.label(format!(
-                "Selected {} of {} ({} of {})",
+                "{} of {} selected · {} of {}",
                 self.selected.len(),
                 results.report.findings.len(),
                 human(selected_size),
                 human(results.report.total_size()),
             ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled(idle && !self.selected.is_empty(), egui::Button::new("Review and move to Recycle Bin…")).clicked() {
+                let none_selected = self.selected.is_empty();
+                let button = ui.add_enabled(idle && !none_selected, egui::Button::new("Move to Recycle Bin…"));
+                if none_selected {
+                    button.clone().on_disabled_hover_text("Select at least one item first.");
+                }
+                if button.clicked() {
                     self.confirm_delete = true;
                 }
             });
@@ -263,7 +271,7 @@ impl DeoxApp {
                 ui.add_space(8.0);
                 ui.label(&self.status);
                 if self.phase == Phase::Scanning {
-                    ui.label(format!("{} files indexed", self.files_seen));
+                    ui.label(format!("{} files checked so far", self.files_seen));
                 }
             });
             return;
@@ -281,11 +289,15 @@ impl DeoxApp {
         };
 
         ui.label(format!(
-            "{} files scanned, {} reclaimable items found{}.",
+            "Scanned {} files. Found {} you could clean up.{}",
             results.files,
-            results.report.findings.len(),
-            if results.unreadable > 0 { format!(", {} paths could not be read", results.unreadable) } else { String::new() },
+            items(results.report.findings.len()),
+            if results.unreadable > 0 { format!(" {} couldn't be read and were left out.", paths(results.unreadable)) } else { String::new() },
         ));
+        if results.report.findings.is_empty() {
+            ui.add_space(8.0);
+            ui.label("Nothing to clean up here. Try another folder or a whole drive.");
+        }
         ui.separator();
 
         let row_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + ui.spacing().item_spacing.y * 2.0;
@@ -355,10 +367,11 @@ impl DeoxApp {
             let total: u64 = findings.iter().map(|f| f.size).sum();
             let mut run = false;
             let mut cancel = false;
-            egui::Window::new("Confirm").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            let title = if self.dry_run { "Check before moving" } else { "Move to Recycle Bin?" };
+            egui::Window::new(title).collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.set_width(640.0);
-                ui.label(format!("{} items, {} in total, will be moved to the Recycle Bin and can be restored from there.", findings.len(), human(total)));
-                ui.label("Items that changed since the scan, or that are protected, are skipped.");
+                ui.label(format!("{} ({}) will be moved to the Recycle Bin. You can restore them from there.", items(findings.len()), human(total)));
+                ui.label("Anything that changed since the scan, or sits in a protected location, is skipped.");
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical().max_height(300.0).show_rows(ui, 18.0, findings.len(), |ui, range| {
                     for f in &findings[range] {
@@ -366,10 +379,10 @@ impl DeoxApp {
                     }
                 });
                 ui.add_space(6.0);
-                ui.checkbox(&mut self.dry_run, "Preview only: check everything but move nothing");
+                ui.checkbox(&mut self.dry_run, "Check only. Move nothing yet.");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let label = if self.dry_run { "Run preview" } else { "Move to Recycle Bin" };
+                    let label = if self.dry_run { "Check items".to_string() } else { format!("Move {} to Recycle Bin", items(findings.len())) };
                     run = ui.button(label).clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
@@ -377,7 +390,7 @@ impl DeoxApp {
             if run {
                 self.confirm_delete = false;
                 self.phase = Phase::Deleting;
-                self.status = if self.dry_run { "Checking selected items…".into() } else { "Moving items to the Recycle Bin…".into() };
+                self.status = if self.dry_run { "Checking the selected items…".into() } else { "Moving the selected items to the Recycle Bin…".into() };
                 worker::spawn_delete(findings, self.dry_run, self.notifier());
             } else if cancel {
                 self.confirm_delete = false;
@@ -386,22 +399,28 @@ impl DeoxApp {
 
         if let Some((report, dry_run)) = &self.last_delete {
             let mut close = false;
-            egui::Window::new(if *dry_run { "Preview result" } else { "Result" })
+            let mut move_now = false;
+            egui::Window::new(if *dry_run { "Check complete" } else { "Moved to Recycle Bin" })
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.set_width(640.0);
                     let count = |o: fn(&Outcome) -> bool| report.entries.iter().filter(|e| o(&e.outcome)).count();
+                    let ready = count(|o| *o == Outcome::WouldDelete);
                     if *dry_run {
-                        ui.label(format!("{} items would be moved. Nothing was changed.", count(|o| *o == Outcome::WouldDelete)));
+                        ui.label(format!("{} can be moved. Nothing was changed.", items(ready)));
                     } else {
-                        ui.label(format!("{} items moved to the Recycle Bin, {} freed.", count(|o| *o == Outcome::Deleted), human(report.freed_bytes())));
+                        ui.label(format!(
+                            "{} moved to the Recycle Bin. Empty the Recycle Bin to free {}.",
+                            items(count(|o| *o == Outcome::Deleted)),
+                            human(report.freed_bytes())
+                        ));
                     }
                     let problems: Vec<_> =
                         report.entries.iter().filter(|e| e.outcome != Outcome::Deleted && e.outcome != Outcome::WouldDelete).collect();
                     if !problems.is_empty() {
                         ui.add_space(6.0);
-                        ui.label(format!("{} items were skipped:", problems.len()));
+                        ui.label(format!("{} skipped:", items(problems.len())));
                         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                             for e in problems {
                                 ui.add(egui::Label::new(format!("{}  {}", describe(&e.outcome), e.path.display())).truncate());
@@ -409,9 +428,20 @@ impl DeoxApp {
                         });
                     }
                     ui.add_space(6.0);
-                    close = ui.button("Close").clicked();
+                    ui.horizontal(|ui| {
+                        if *dry_run && ready > 0 {
+                            move_now = ui.button(format!("Move {} to Recycle Bin", items(ready))).clicked();
+                        }
+                        close = ui.button(if *dry_run && ready > 0 { "Not now" } else { "Close" }).clicked();
+                    });
                 });
-            if close {
+            if move_now {
+                self.last_delete = None;
+                self.dry_run = false;
+                self.phase = Phase::Deleting;
+                self.status = "Moving the selected items to the Recycle Bin…".into();
+                worker::spawn_delete(self.selected_findings(), false, self.notifier());
+            } else if close {
                 self.last_delete = None;
             }
         }
@@ -423,7 +453,7 @@ impl DeoxApp {
                 egui::Window::new("Open uninstaller").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                     ui.set_width(520.0);
                     ui.label(&finding.reason);
-                    ui.label("Deox will only start the program's own uninstaller; it removes nothing itself.");
+                    ui.label("Deox only starts the program's own uninstaller. It removes nothing itself.");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Open uninstaller").clicked() {
@@ -445,11 +475,11 @@ impl DeoxApp {
 
         if let Some(message) = &self.error {
             let mut close = false;
-            egui::Window::new("Something went wrong").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            egui::Window::new("Couldn't complete that").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.set_width(480.0);
                 ui.label(message);
                 ui.add_space(6.0);
-                close = ui.button("OK").clicked();
+                close = ui.button("Close").clicked();
             });
             if close {
                 self.error = None;
@@ -514,10 +544,18 @@ fn confidence_tag(confidence: Confidence) -> (&'static str, Color32) {
 fn describe(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Deleted | Outcome::WouldDelete => "ok".into(),
-        Outcome::Protected => "protected".into(),
-        Outcome::NotDeletable => "not removable".into(),
-        Outcome::Missing => "already gone".into(),
-        Outcome::Changed => "changed since scan".into(),
-        Outcome::Failed(why) => format!("failed: {why}"),
+        Outcome::Protected => "Protected location".into(),
+        Outcome::NotDeletable => "Can't be removed".into(),
+        Outcome::Missing => "Already gone".into(),
+        Outcome::Changed => "Changed since the scan".into(),
+        Outcome::Failed(why) => format!("Failed: {why}"),
     }
+}
+
+fn items(n: usize) -> String {
+    if n == 1 { "1 item".into() } else { format!("{n} items") }
+}
+
+fn paths(n: usize) -> String {
+    if n == 1 { "1 path".into() } else { format!("{n} paths") }
 }

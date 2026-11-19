@@ -5,8 +5,10 @@ mod worker;
 use deox_core::delete::{launch_uninstaller, DeleteReport, Outcome};
 use deox_core::report::{Category, Confidence, Finding, Report};
 use deox_core::scan::Cancel;
+use deox_core::treemap::{squarify, FolderTree, Rect};
 use eframe::egui::{self, Color32, RichText};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -64,6 +66,14 @@ struct Results {
     report: Report,
     files: u64,
     unreadable: usize,
+    /// Folder sizes for the map; dropped after a move, because they would no longer match the disk.
+    tree: Option<FolderTree>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum View {
+    List,
+    Map,
 }
 
 struct DeoxApp {
@@ -85,6 +95,9 @@ struct DeoxApp {
     filter: String,
     /// Per finding: whether it passes the current filter.
     visible: Vec<bool>,
+    view: View,
+    /// The folder shown in the map, as a node of the folder tree.
+    map_folder: usize,
     /// Row highlighted for keyboard control, as a position in `rows`.
     cursor_row: Option<usize>,
     /// Scroll offset to apply on the next frame, set when the cursor leaves the view.
@@ -123,6 +136,8 @@ impl DeoxApp {
             move_cancel: Arc::new(Cancel::default()),
             filter: String::new(),
             visible: Vec::new(),
+            view: View::List,
+            map_folder: FolderTree::ROOT,
             cursor_row: None,
             scroll_to: None,
             scroll_state: (0.0, 0.0),
@@ -182,11 +197,12 @@ impl DeoxApp {
         worker::spawn_delete(findings, dry_run, self.move_cancel.clone(), self.notifier());
     }
 
-    fn set_results(&mut self, findings: Vec<Finding>, files: u64, unreadable: usize) {
+    fn set_results(&mut self, findings: Vec<Finding>, files: u64, unreadable: usize, tree: Option<FolderTree>) {
         // Only regenerating caches start selected; everything else is the user's call.
         self.selected =
             findings.iter().enumerate().filter(|(_, f)| f.confidence == Confidence::Safe).map(|(i, _)| i).collect();
-        self.results = Some(Results { report: Report::new(findings), files, unreadable });
+        self.results = Some(Results { report: Report::new(findings), files, unreadable, tree });
+        self.map_folder = FolderTree::ROOT;
         self.rebuild_rows();
     }
 
@@ -225,7 +241,7 @@ impl DeoxApp {
                     self.status = "Scan cancelled.".into();
                 } else {
                     self.status = String::new();
-                    self.set_results(a.findings, a.files, a.unreadable);
+                    self.set_results(a.findings, a.files, a.unreadable, a.tree);
                 }
             }
             Msg::Deleted(report) => {
@@ -252,7 +268,8 @@ impl DeoxApp {
         let findings: Vec<Finding> = results.report.findings.into_iter().filter(|f| !gone.contains(&f.path)).collect();
         self.selected =
             findings.iter().enumerate().filter(|(_, f)| keep_selected.contains(&f.path)).map(|(i, _)| i).collect();
-        self.results = Some(Results { report: Report::new(findings), ..results });
+        self.results = Some(Results { report: Report::new(findings), tree: None, ..results });
+        self.view = View::List;
         self.rebuild_rows();
     }
 
@@ -433,6 +450,39 @@ impl DeoxApp {
             egui::CollapsingHeader::new("What do Safe, Review and Info mean?").show(ui, legend);
         }
         ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.view, View::List, "List");
+            let map_ready = results.tree.is_some();
+            ui.add_enabled_ui(map_ready, |ui| {
+                ui.selectable_value(&mut self.view, View::Map, "Map");
+            })
+            .response
+            .on_disabled_hover_text("The map is out of date after a move. Scan again to refresh it.");
+        });
+        if let (View::Map, Some(tree)) = (self.view, &results.tree) {
+            let dark = ui.visuals().dark_mode;
+            if let Some(action) = map_view(ui, tree, &mut self.map_folder, dark, &results.report, &self.selected) {
+                match action {
+                    MapAction::ShowInList(path) => {
+                        self.filter = path;
+                        self.view = View::List;
+                        self.rebuild_rows();
+                    }
+                    MapAction::SelectSafe(path) => {
+                        for (i, f) in results.report.findings.iter().enumerate() {
+                            if f.confidence == Confidence::Safe && f.path.starts_with(&path) {
+                                self.selected.insert(i);
+                            }
+                        }
+                    }
+                    MapAction::ClearHere(path) => {
+                        self.selected.retain(|i| !results.report.findings.get(*i).is_some_and(|f| f.path.starts_with(&path)));
+                    }
+                }
+            }
+            return;
+        }
 
         let mut filter_changed = false;
         ui.horizontal(|ui| {
@@ -952,6 +1002,207 @@ fn paths(n: usize) -> String {
     if n == 1 { "1 path".into() } else { format!("{n} paths") }
 }
 
+
+/// Most tiles drawn for one folder; the rest are merged into one tile.
+const MAP_TILES: usize = 300;
+
+/// Folders below this share of their parent are merged into one "smaller folders" tile.
+const MAP_MIN_SHARE: u64 = 100;
+
+/// What the user asked for in the map besides browsing it.
+enum MapAction {
+    /// Show the items under this folder in the list.
+    ShowInList(String),
+    /// Select every Safe item under this folder.
+    SelectSafe(PathBuf),
+    /// Clear the selection under this folder.
+    ClearHere(PathBuf),
+}
+
+/// Draws the folder at `folder` as a treemap. Clicking a tile opens that folder.
+fn map_view(
+    ui: &mut egui::Ui,
+    tree: &FolderTree,
+    folder: &mut usize,
+    dark: bool,
+    report: &Report,
+    selected: &HashSet<usize>,
+) -> Option<MapAction> {
+    let mut action = None;
+    let folder_path = tree.path(*folder);
+    ui.horizontal_wrapped(|ui| {
+        for (n, id) in tree.trail(*folder).into_iter().enumerate() {
+            if n > 0 {
+                ui.label("›");
+            }
+            let name = if n == 0 { tree.path(id).display().to_string() } else { tree.node(id).name.clone() };
+            if ui.selectable_label(id == *folder, name).clicked() {
+                *folder = id;
+            }
+        }
+    });
+    let node = tree.node(*folder);
+
+    // Selected items under this folder, counted per tile.
+    let names: HashMap<&OsStr, usize> = node.children.iter().map(|c| (OsStr::new(tree.node(*c).name.as_str()), *c)).collect();
+    let mut chosen: HashMap<usize, (usize, u64)> = HashMap::new();
+    let mut chosen_here = 0;
+    for finding in selected.iter().filter_map(|i| report.findings.get(*i)) {
+        let Ok(relative) = finding.path.strip_prefix(&folder_path) else { continue };
+        chosen_here += 1;
+        if let Some(child) = relative.components().next().and_then(|c| names.get(c.as_os_str())) {
+            let entry = chosen.entry(*child).or_default();
+            entry.0 += 1;
+            entry.1 += finding.size;
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(human(node.size)).strong());
+        ui.label(RichText::new(format!("in this folder · {} Safe · {} Review suggested", human(node.safe), human(node.review))).weak());
+        if ui.button("Show these items in the list").clicked() {
+            action = Some(MapAction::ShowInList(folder_path.display().to_string()));
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Select Safe items here").on_hover_text("Selects every Safe item under this folder. Nothing moves until you confirm.").clicked() {
+            action = Some(MapAction::SelectSafe(folder_path.clone()));
+        }
+        if ui.add_enabled(chosen_here > 0, egui::Button::new("Clear selection here")).clicked() {
+            action = Some(MapAction::ClearHere(folder_path.clone()));
+        }
+        ui.label(RichText::new(format!("{} selected under this folder", items(chosen_here))).weak());
+    });
+
+    let (_, safe_color, _) = confidence_tag(Confidence::Safe, dark);
+    let (_, review_color, _) = confidence_tag(Confidence::Review, dark);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Tile size is its share of this folder.").weak());
+        for (color, name) in [(safe_color, "Safe"), (review_color, "Review")] {
+            let (swatch, _) = ui.allocate_exact_size(egui::vec2(18.0, 8.0), egui::Sense::hover());
+            ui.painter().rect_filled(swatch, 2.0, color);
+            ui.label(RichText::new(name).weak());
+        }
+        ui.label(RichText::new("stripe: what Deox suggests inside.").weak());
+    });
+
+    // The subfolders holding the most suggested bytes, as shortcuts.
+    let mut flagged: Vec<(usize, u64)> =
+        node.children.iter().map(|c| (*c, tree.node(*c).safe + tree.node(*c).review)).filter(|(_, bytes)| *bytes > 0).collect();
+    flagged.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+    if !flagged.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Where to look:").strong());
+            for (child, bytes) in flagged.into_iter().take(3) {
+                if ui.button(format!("{} · {}", tree.node(child).name, human(bytes))).clicked() {
+                    *folder = child;
+                }
+            }
+        });
+    }
+    ui.add_space(4.0);
+
+    let threshold = node.size / MAP_MIN_SHARE;
+    let mut tiles: Vec<(Option<usize>, String, u64)> = Vec::new();
+    let (mut merged, mut merged_size) = (0usize, 0u64);
+    for (position, child) in node.children.iter().enumerate() {
+        let size = tree.node(*child).size;
+        if position < MAP_TILES && size >= threshold.max(1) {
+            tiles.push((Some(*child), tree.node(*child).name.clone(), size));
+        } else {
+            merged += 1;
+            merged_size += size;
+        }
+    }
+    if merged > 0 && merged_size > 0 {
+        tiles.push((None, format!("{merged} smaller folders"), merged_size));
+    }
+    if node.files_size > 0 {
+        tiles.push((None, "Files in this folder".into(), node.files_size));
+    }
+    tiles.sort_by_key(|t| std::cmp::Reverse(t.2));
+    if tiles.is_empty() {
+        ui.label("This folder is empty.");
+        return action;
+    }
+
+    let available = ui.available_size();
+    let (area, _) = ui.allocate_exact_size(egui::vec2(available.x, available.y.max(160.0)), egui::Sense::hover());
+    let sizes: Vec<u64> = tiles.iter().map(|t| t.2).collect();
+    let rects = squarify(&sizes, Rect { x: area.min.x, y: area.min.y, w: area.width(), h: area.height() });
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let line = ui.text_style_height(&egui::TextStyle::Body) + 2.0;
+
+    for (index, ((target, name, size), r)) in tiles.iter().zip(&rects).enumerate() {
+        let tile = egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h)).shrink(1.0);
+        if tile.width() < 2.0 || tile.height() < 2.0 {
+            continue;
+        }
+        let opens = target.is_some_and(|c| !tree.node(c).children.is_empty());
+        let sense = if opens { egui::Sense::click() } else { egui::Sense::hover() };
+        let response = ui.interact(tile, ui.auto_id_with(("tile", index)), sense);
+        let widgets = &ui.visuals().widgets;
+        let (fill, text_color) = if response.hovered() {
+            (widgets.hovered.bg_fill, widgets.hovered.fg_stroke.color)
+        } else {
+            (widgets.inactive.bg_fill, widgets.inactive.fg_stroke.color)
+        };
+        let painter = ui.painter().with_clip_rect(tile);
+        painter.rect_filled(tile, 2.0, fill);
+        let mut detail = String::new();
+        let stripe = (tile.height() / 4.0).min(8.0);
+        if let Some(c) = target {
+            let child = tree.node(*c);
+            let width = tile.width();
+            let share = |bytes: u64| if bytes == 0 { 0.0 } else { (width * bytes as f32 / child.size.max(1) as f32).max(6.0) };
+            let safe_w = share(child.safe).min(width);
+            let review_w = share(child.review).min(width - safe_w);
+            let bottom = tile.bottom();
+            let at = |from: f32, to: f32| egui::Rect::from_min_max(egui::pos2(tile.left() + from, bottom - stripe), egui::pos2(tile.left() + to, bottom));
+            painter.rect_filled(at(0.0, safe_w), 0.0, safe_color);
+            painter.rect_filled(at(safe_w, safe_w + review_w), 0.0, review_color);
+            detail = format!("\n{} Safe, {} Review suggested", human(child.safe), human(child.review));
+        }
+        if let Some((count, bytes)) = target.and_then(|c| chosen.get(&c)) {
+            painter.rect_stroke(tile, 2.0, egui::Stroke::new(2.0, ui.visuals().selection.stroke.color), egui::StrokeKind::Inside);
+            if tile.width() > 90.0 && tile.height() > 24.0 + line * 2.0 + stripe {
+                painter.text(
+                    tile.left_bottom() + egui::vec2(6.0, -stripe - 4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{count} selected · {}", human(*bytes)),
+                    font.clone(),
+                    text_color,
+                );
+            }
+            detail.push_str(&format!("\n{} selected", items(*count)));
+        }
+        if tile.width() > 56.0 && tile.height() > 24.0 {
+            painter.text(tile.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, name, font.clone(), text_color);
+            if tile.height() > 24.0 + line {
+                painter.text(tile.left_top() + egui::vec2(6.0, 4.0 + line), egui::Align2::LEFT_TOP, human(*size), font.clone(), text_color.gamma_multiply(0.8));
+            }
+        }
+        if opens && tile.width() > 40.0 && tile.height() > 24.0 {
+            // A small arrow marks tiles that open into subfolders.
+            let c = egui::pos2(tile.right() - 12.0, tile.top() + 12.0);
+            let points = vec![c + egui::vec2(-3.0, -5.0), c + egui::vec2(-3.0, 5.0), c + egui::vec2(4.0, 0.0)];
+            painter.add(egui::Shape::convex_polygon(points, text_color.gamma_multiply(0.7), egui::Stroke::NONE));
+        }
+        if let Some(c) = target {
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{name}, {}", human(*size))));
+            let hint = if opens { "\nClick to open." } else { "" };
+            let clicked = response.clicked();
+            let response = if opens { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };
+            response.on_hover_text(format!("{}\n{}{detail}{hint}", tree.path(*c).display(), human(*size)));
+            if clicked {
+                *folder = *c;
+            }
+        } else {
+            response.on_hover_text(format!("{name}: {}", human(*size)));
+        }
+    }
+    action
+}
 
 /// A small triangle that points right when the group is collapsed and down when it is open.
 fn disclosure_icon(ui: &mut egui::Ui, open: bool) -> egui::Response {

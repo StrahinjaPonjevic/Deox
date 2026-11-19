@@ -7,6 +7,7 @@ use deox_core::programs::{installed_programs, AppxRegistry, BloatwareList, Windo
 use deox_core::report::Finding;
 use deox_core::rules::Rules;
 use deox_core::scan::{scan_with_folders, Cancel};
+use deox_core::treemap::FolderTree;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -21,6 +22,8 @@ pub struct Analysis {
     /// Paths that could not be read (no permission, in use).
     pub unreadable: usize,
     pub cancelled: bool,
+    /// Folder sizes for the map view; `None` when the scan was cancelled.
+    pub tree: Option<FolderTree>,
 }
 
 pub enum Msg {
@@ -111,7 +114,7 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
     );
     let files = index.files.len() as u64;
     let mut unreadable = index.errors.len();
-    let cancelled = |findings| Analysis { findings, files, unreadable, cancelled: true };
+    let cancelled = |findings| Analysis { findings, files, unreadable, cancelled: true, tree: None };
     if index.cancelled {
         return Ok(cancelled(Vec::new()));
     }
@@ -135,5 +138,6 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
     programs.extend(installed_programs(&AppxRegistry));
     findings.extend(BloatwareList::builtin()?.evaluate(&programs));
 
-    Ok(Analysis { findings, files, unreadable, cancelled: false })
+    let tree = FolderTree::build(root, &index, &findings);
+    Ok(Analysis { findings, files, unreadable, cancelled: false, tree: Some(tree) })
 }

@@ -1,0 +1,91 @@
+# Cleanup rules. Globs match full paths, case-insensitively; `*` also crosses folders.
+# %VAR% expands to an environment variable. A rule that points into a protected
+# zone has no effect unless the folder is on the allowlist in `src/protect.rs`.
+#
+# kind = "file" (default): every matching file is its own finding.
+# kind = "dir": a matching folder is one finding, offered only when nothing in the
+#               project around it changed for `min_age_days`.
+
+[[rule]]
+name = "User temporary files"
+category = "Temp"
+confidence = "Safe"
+path_glob = "%TEMP%\\*"
+min_age_days = 7
+reason = "Temporary files that applications leave behind; not touched for over a week."
+
+[[rule]]
+name = "Windows temporary files"
+category = "Temp"
+confidence = "Safe"
+path_glob = "%SystemRoot%\\Temp\\*"
+min_age_days = 7
+reason = "System temporary files; not touched for over a week."
+
+[[rule]]
+name = "Windows Update downloads"
+category = "Temp"
+confidence = "Safe"
+path_glob = "%SystemRoot%\\SoftwareDistribution\\Download\\*"
+min_age_days = 7
+reason = "Update packages already downloaded; Windows fetches them again if needed."
+
+[[rule]]
+name = "Delivery Optimization cache"
+category = "AppCache"
+confidence = "Safe"
+path_glob = "%SystemRoot%\\SoftwareDistribution\\DeliveryOptimization\\*"
+reason = "Windows Update peer-to-peer cache; rebuilt on demand."
+
+[[rule]]
+name = "DirectX shader cache"
+category = "AppCache"
+confidence = "Safe"
+path_glob = "{%LOCALAPPDATA%\\D3DSCache,%LOCALAPPDATA%\\NVIDIA\\DXCache}\\*"
+reason = "Compiled shaders; games and drivers rebuild them on next launch."
+
+[[rule]]
+name = "Crash dumps"
+category = "Temp"
+confidence = "Safe"
+path_glob = "%LOCALAPPDATA%\\CrashDumps\\*.dmp"
+reason = "Memory dumps from crashed applications; only useful for debugging."
+
+[[rule]]
+name = "Electron application caches"
+category = "AppCache"
+confidence = "Safe"
+path_glob = "%APPDATA%\\{Discord,Slack,Spotify,Microsoft\\Teams,Code}\\{Cache,Code Cache,GPUCache}\\*"
+reason = "Web cache of the application; it downloads it again when needed."
+
+[[rule]]
+name = "Browser cache"
+category = "AppCache"
+confidence = "Safe"
+path_glob = "{%LOCALAPPDATA%\\Google\\Chrome,%LOCALAPPDATA%\\Microsoft\\Edge}\\User Data\\Default\\{Cache,Code Cache,GPUCache}\\*"
+reason = "Cached web content of the default browser profile; pages are downloaded again."
+
+[[rule]]
+name = "Package manager caches"
+category = "AppCache"
+confidence = "Safe"
+path_glob = "{%LOCALAPPDATA%\\npm-cache,%LOCALAPPDATA%\\pip\\Cache,%USERPROFILE%\\.cargo\\registry\\cache,%USERPROFILE%\\.gradle\\caches}\\*"
+reason = "Downloaded packages; fetched again on the next install or build (needs internet)."
+
+[[rule]]
+name = "Node.js dependencies"
+category = "DevArtifact"
+confidence = "Review"
+kind = "dir"
+path_glob = "**/node_modules"
+min_age_days = 90
+reason = "Installed dependencies of an inactive project; `npm install` restores them."
+
+[[rule]]
+name = "Python virtual environments"
+category = "DevArtifact"
+confidence = "Review"
+kind = "dir"
+path_glob = "**/.venv"
+min_age_days = 90
+reason = "Virtual environment of an inactive project; can be recreated from its requirements."

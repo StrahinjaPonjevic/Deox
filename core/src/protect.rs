@@ -87,7 +87,7 @@ fn key_of(path: &Path) -> Key {
 
 /// Makes the path absolute, collapses `.`/`..` and follows links where it can.
 /// Works for paths that do not exist (yet) by resolving the deepest existing ancestor.
-fn resolve(path: &Path) -> PathBuf {
+pub(crate) fn resolve(path: &Path) -> PathBuf {
     if let Ok(real) = path.canonicalize() {
         return strip_verbatim(real);
     }

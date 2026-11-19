@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.104"
 deox-core = { path = "../core" }
+eframe = "0.37.0"
+rfd = "0.18.0"

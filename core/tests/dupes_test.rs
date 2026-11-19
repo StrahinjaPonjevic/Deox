@@ -11,7 +11,7 @@ fn write(path: &Path, content: &[u8]) {
 
 fn find(dir: &Path) -> Duplicates {
     let cancel = Cancel::default();
-    find_duplicates(&scan(dir, &cancel, |_| {}), &cancel)
+    find_duplicates(&scan(dir, &cancel, |_| {}), &cancel, 1, &|_, _, _| {})
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn unreadable_file_is_reported_not_fatal() {
     let index = scan(dir.path(), &cancel, |_| {});
     fs::remove_file(dir.path().join("c")).unwrap();
 
-    let dupes = find_duplicates(&index, &cancel);
+    let dupes = find_duplicates(&index, &cancel, 1, &|_, _, _| {});
 
     assert_eq!(dupes.errors.len(), 1);
     assert_eq!(dupes.groups[0].files.len(), 2);
@@ -117,8 +117,43 @@ fn cancelled_search_returns_no_groups() {
     let cancel = Cancel::default();
     cancel.cancel();
 
-    let dupes = find_duplicates(&index, &cancel);
+    let dupes = find_duplicates(&index, &cancel, 1, &|_, _, _| {});
 
     assert!(dupes.cancelled);
     assert!(dupes.groups.is_empty());
+}
+
+#[test]
+fn files_below_the_minimum_size_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("small_a"), &[1u8; 100]);
+    write(&dir.path().join("small_b"), &[1u8; 100]);
+    write(&dir.path().join("big_a"), &[2u8; 5000]);
+    write(&dir.path().join("big_b"), &[2u8; 5000]);
+    let cancel = Cancel::default();
+    let index = scan(dir.path(), &cancel, |_| {});
+
+    let dupes = find_duplicates(&index, &cancel, 1000, &|_, _, _| {});
+
+    assert_eq!(dupes.groups.len(), 1);
+    assert_eq!(dupes.groups[0].size, 5000);
+}
+
+#[test]
+fn progress_is_reported_for_every_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("a"), b"data");
+    write(&dir.path().join("b"), b"data");
+    let cancel = Cancel::default();
+    let index = scan(dir.path(), &cancel, |_| {});
+    let seen = std::sync::Mutex::new(Vec::new());
+
+    find_duplicates(&index, &cancel, 1, &|stage, done, total| {
+        seen.lock().unwrap().push((stage.to_string(), done, total));
+    });
+
+    let seen = seen.into_inner().unwrap();
+    for stage in ["Comparing file beginnings", "Checking for hard links", "Comparing whole files"] {
+        assert!(seen.iter().any(|(s, done, total)| s == stage && done == total && *total == 2), "{stage}: {seen:?}");
+    }
 }

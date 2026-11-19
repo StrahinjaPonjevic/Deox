@@ -41,8 +41,8 @@ pub struct Finding {
 pub struct CategoryGroup<'a> {
     pub category: Category,
     pub total_size: u64,
-    /// Largest first.
-    pub findings: Vec<&'a Finding>,
+    /// Position in `Report::findings` and the finding itself, largest first.
+    pub items: Vec<(usize, &'a Finding)>,
 }
 
 pub struct Report {
@@ -60,19 +60,19 @@ impl Report {
 
     /// Groups by category, the group with the most reclaimable space first.
     pub fn groups(&self) -> Vec<CategoryGroup<'_>> {
-        let mut sorted: Vec<&Finding> = self.findings.iter().collect();
-        sorted.sort_by_key(|f| std::cmp::Reverse(f.size));
+        let mut sorted: Vec<(usize, &Finding)> = self.findings.iter().enumerate().collect();
+        sorted.sort_by_key(|(_, f)| std::cmp::Reverse(f.size));
         let mut groups: Vec<CategoryGroup> = Vec::new();
-        for finding in sorted {
+        for (index, finding) in sorted {
             match groups.iter_mut().find(|g| g.category == finding.category) {
                 Some(group) => {
                     group.total_size += finding.size;
-                    group.findings.push(finding);
+                    group.items.push((index, finding));
                 }
                 None => groups.push(CategoryGroup {
                     category: finding.category,
                     total_size: finding.size,
-                    findings: vec![finding],
+                    items: vec![(index, finding)],
                 }),
             }
         }

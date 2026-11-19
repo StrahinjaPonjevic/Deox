@@ -250,7 +250,8 @@ fn report_groups_by_category_and_sums_sizes() {
     assert_eq!(groups[0].category, Category::AppCache);
     assert_eq!(groups[1].category, Category::Temp);
     assert_eq!(groups[1].total_size, 400);
-    assert_eq!(groups[1].findings.iter().map(|f| f.size).collect::<Vec<_>>(), vec![300, 100]);
+    assert_eq!(groups[1].items.iter().map(|(_, f)| f.size).collect::<Vec<_>>(), vec![300, 100]);
+    assert_eq!(groups[1].items.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![2, 0]);
 }
 
 fn finding_stub() -> Finding {

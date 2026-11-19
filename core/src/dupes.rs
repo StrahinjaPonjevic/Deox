@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -35,27 +36,57 @@ pub struct Duplicates {
 }
 
 /// Finds files with identical content: by size, then a hash of the first 64 KiB,
-/// then a hash of the whole file. Empty files are ignored.
-pub fn find_duplicates(index: &Index, cancel: &Cancel) -> Duplicates {
+/// then a hash of the whole file. Files smaller than `min_size` bytes and empty files
+/// are ignored. `progress(stage, done, total)` is called from worker threads.
+pub fn find_duplicates(
+    index: &Index,
+    cancel: &Cancel,
+    min_size: u64,
+    progress: &(dyn Fn(&str, u64, u64) + Sync),
+) -> Duplicates {
     let errors = Mutex::new(Vec::new());
 
     let mut by_size: HashMap<u64, Vec<&FileEntry>> = HashMap::new();
-    for file in index.files.iter().filter(|f| f.size > 0) {
+    for file in index.files.iter().filter(|f| f.size > 0 && f.size >= min_size) {
         by_size.entry(file.size).or_default().push(file);
     }
     let candidates: Vec<&FileEntry> = by_size.into_values().filter(|g| g.len() > 1).flatten().collect();
 
-    let partial = hash_groups(candidates, Some(PARTIAL_BYTES), cancel, &errors);
+    let partial = hash_groups(candidates, Some(PARTIAL_BYTES), cancel, &errors, &Stage::new("Comparing file beginnings", progress));
     // Hard links share their content, so they are collapsed before the costly full read.
+    let stage = Stage::new("Checking for hard links", progress);
+    stage.total.store(partial.iter().map(|g| g.len() as u64).sum(), Ordering::Relaxed);
     let distinct: Vec<&FileEntry> =
-        partial.into_iter().flat_map(|g| distinct_on_disk(g, &errors)).collect();
-    let full = hash_groups(distinct, None, cancel, &errors);
+        partial.into_par_iter().flat_map_iter(|g| distinct_on_disk(g, cancel, &errors, &stage)).collect();
+    let full = hash_groups(distinct, None, cancel, &errors, &Stage::new("Comparing whole files", progress));
 
     let errors = errors.into_inner().unwrap_or_default();
     if cancel.is_cancelled() {
         return Duplicates { groups: Vec::new(), errors, cancelled: true };
     }
     Duplicates { groups: full.into_iter().map(group).collect(), errors, cancelled: false }
+}
+
+/// Progress of one phase, reported every few hundred files.
+struct Stage<'a> {
+    label: &'static str,
+    total: AtomicU64,
+    done: AtomicU64,
+    report: &'a (dyn Fn(&str, u64, u64) + Sync),
+}
+
+impl<'a> Stage<'a> {
+    fn new(label: &'static str, report: &'a (dyn Fn(&str, u64, u64) + Sync)) -> Self {
+        Stage { label, total: AtomicU64::new(0), done: AtomicU64::new(0), report }
+    }
+
+    fn tick(&self) {
+        let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = self.total.load(Ordering::Relaxed);
+        if done.is_multiple_of(256) || done == total {
+            (self.report)(self.label, done, total);
+        }
+    }
 }
 
 impl DupeGroup {
@@ -97,14 +128,18 @@ fn hash_groups<'a>(
     limit: Option<u64>,
     cancel: &Cancel,
     errors: &Mutex<Vec<ScanError>>,
+    stage: &Stage,
 ) -> Vec<Vec<&'a FileEntry>> {
+    stage.total.store(files.len() as u64, Ordering::Relaxed);
     let hashed: Vec<((u64, Hash), &FileEntry)> = files
         .into_par_iter()
         .filter_map(|file| {
             if cancel.is_cancelled() {
                 return None;
             }
-            match hash_file(&file.path, limit) {
+            let result = hash_file(&file.path, limit);
+            stage.tick();
+            match result {
                 Ok(hash) => Some(((file.size, hash), file)),
                 Err(e) => {
                     record(errors, &file.path, &e);
@@ -122,15 +157,26 @@ fn hash_groups<'a>(
 
 /// Drops files that are the same on-disk file as one already seen (hard links).
 /// Returns nothing if fewer than two distinct files remain.
-fn distinct_on_disk<'a>(files: Vec<&'a FileEntry>, errors: &Mutex<Vec<ScanError>>) -> Vec<&'a FileEntry> {
+fn distinct_on_disk<'a>(
+    files: Vec<&'a FileEntry>,
+    cancel: &Cancel,
+    errors: &Mutex<Vec<ScanError>>,
+    stage: &Stage,
+) -> Vec<&'a FileEntry> {
     let mut seen = HashSet::new();
     let distinct: Vec<&FileEntry> = files
         .into_iter()
-        .filter(|file| match Handle::from_path(&file.path) {
-            Ok(handle) => seen.insert(handle),
-            Err(e) => {
-                record(errors, &file.path, &e);
-                false
+        .filter(|file| {
+            stage.tick();
+            if cancel.is_cancelled() {
+                return false;
+            }
+            match Handle::from_path(&file.path) {
+                Ok(handle) => seen.insert(handle),
+                Err(e) => {
+                    record(errors, &file.path, &e);
+                    false
+                }
             }
         })
         .collect();

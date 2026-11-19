@@ -1,5 +1,6 @@
 use deox_core::programs::{
-    installed_programs, BloatwareList, Program, ProgramSource, RawRecord, WindowsRegistry,
+    appx_record, installed_programs, AppxRegistry, BloatwareList, Program, ProgramSource, RawRecord,
+    WindowsRegistry,
 };
 use deox_core::report::{Category, Confidence};
 use std::path::PathBuf;
@@ -132,4 +133,56 @@ fn real_registry_can_be_read() {
 
     assert!(!programs.is_empty());
     assert!(programs.iter().all(|p| !p.name.trim().is_empty()));
+}
+
+const HUB: &str = "Microsoft.MicrosoftOfficeHub_18.2.1.0_x64__8wekyb3d8bbwe";
+
+#[test]
+fn appx_package_name_is_taken_from_the_registry_key() {
+    let root = r"C:\Program Files\WindowsApps\Microsoft.MicrosoftOfficeHub_18.2.1.0_x64__8wekyb3d8bbwe";
+
+    let programs = installed_programs(&Fake(vec![appx_record(HUB, Some(root))]));
+
+    assert_eq!(programs.len(), 1);
+    assert_eq!(programs[0].name, "Microsoft.MicrosoftOfficeHub");
+    assert_eq!(programs[0].size, None);
+    assert_eq!(programs[0].install_location, Some(PathBuf::from(root)));
+    // AppX has no uninstall command; the only offer is the Apps page in Settings.
+    assert_eq!(programs[0].uninstall.as_deref(), Some("ms-settings:appsfeatures"));
+}
+
+#[test]
+fn appx_resource_and_system_packages_are_skipped() {
+    let language = appx_record("Microsoft.Foo_1.0.0.0_neutral_split.language-sr_8wekyb3d8bbwe", None);
+    let system = appx_record(
+        "Microsoft.LockApp_10.0_neutral__cw5n1h2txyewy",
+        Some(r"C:\WINDOWS\SystemApps\Microsoft.LockApp_cw5n1h2txyewy"),
+    );
+    let empty = appx_record("", None);
+
+    assert!(installed_programs(&Fake(vec![language, system, empty])).is_empty());
+}
+
+#[test]
+fn appx_bloatware_is_reported_without_size() {
+    let list = BloatwareList::builtin().unwrap();
+    let programs = installed_programs(&Fake(vec![
+        appx_record(HUB, None),
+        appx_record("king.com.CandyCrushSaga_1.0_x64__kgqvnymyfvs32", None),
+        appx_record("Microsoft.WindowsNotepad_11.0_x64__8wekyb3d8bbwe", None),
+    ]));
+
+    let findings = list.evaluate(&programs);
+
+    assert_eq!(findings.len(), 2);
+    assert!(findings.iter().all(|f| f.category == Category::Bloatware && f.confidence == Confidence::Info));
+    assert!(findings.iter().all(|f| f.size == 0 && f.uninstall.as_deref() == Some("ms-settings:appsfeatures")));
+}
+
+#[test]
+fn real_appx_registry_can_be_read() {
+    let programs = installed_programs(&AppxRegistry);
+
+    assert!(!programs.is_empty());
+    assert!(programs.iter().all(|p| !p.name.contains('_')));
 }

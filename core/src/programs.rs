@@ -11,6 +11,11 @@ const BUILTIN: &str = include_str!("../rules/bloatware.toml");
 const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 const UNINSTALL_32BIT: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
 
+const APPX_PACKAGES: &str =
+    r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+/// AppX packages have no uninstaller of their own; this opens the Apps page in Settings.
+const SETTINGS_APPS: &str = "ms-settings:appsfeatures";
+
 /// One uninstall entry exactly as stored, before any filtering.
 #[derive(Debug, Clone, Default)]
 pub struct RawRecord {
@@ -45,6 +50,43 @@ impl ProgramSource for WindowsRegistry {
             records.extend(root.enum_keys().flatten().filter_map(|name| root.open_subkey(name).ok()).map(read_record));
         }
         records
+    }
+}
+
+/// Store (UWP/AppX) packages of the current user.
+pub struct AppxRegistry;
+
+impl ProgramSource for AppxRegistry {
+    fn records(&self) -> Vec<RawRecord> {
+        let Ok(root) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(APPX_PACKAGES) else {
+            return Vec::new();
+        };
+        root.enum_keys()
+            .flatten()
+            .map(|name| {
+                let folder = root.open_subkey(&name).ok().and_then(|k| k.get_value::<String, _>("PackageRootFolder").ok());
+                appx_record(&name, folder.as_deref())
+            })
+            .collect()
+    }
+}
+
+/// Builds a record from a package registry key. `full_name` is
+/// `Name_Version_Architecture_ResourceId_PublisherId`; the stored display name is a
+/// resource reference that cannot be read without Windows APIs, so the package name is used.
+pub fn appx_record(full_name: &str, root_folder: Option<&str>) -> RawRecord {
+    let mut parts = full_name.split('_');
+    let name = parts.next().filter(|n| !n.is_empty());
+    let resource_id = parts.nth(2).unwrap_or_default();
+    RawRecord {
+        display_name: name.map(str::to_string),
+        install_location: root_folder.map(str::to_string),
+        uninstall_string: Some(SETTINGS_APPS.to_string()),
+        // Apps that ship with Windows cannot be removed by the user.
+        system_component: root_folder.is_some_and(|f| f.to_lowercase().contains(r"\systemapps\")),
+        // Language and scale packs belong to another package.
+        has_parent: !resource_id.is_empty(),
+        ..RawRecord::default()
     }
 }
 

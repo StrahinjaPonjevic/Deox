@@ -18,3 +18,15 @@ reason = "Game portal that PC makers preinstall; rarely chosen by the user."
 name = "End-of-life software"
 name_contains = ["Adobe Flash Player"]
 reason = "Discontinued in 2020 and no longer receives security updates."
+
+# Store (AppX) packages are matched on the package name, e.g. `king.com.CandyCrushSaga`.
+
+[[rule]]
+name = "Preinstalled promotional game"
+name_contains = ["king.com.CandyCrush"]
+reason = "Promotional game that Windows installs for new users."
+
+[[rule]]
+name = "Preinstalled promotional app"
+name_contains = ["Microsoft.MicrosoftOfficeHub", "Disney.37853FC22B2CE", "BytedancePte.Ltd.TikTok"]
+reason = "Promotional app that comes with Windows; removing it does not affect the system."

@@ -30,6 +30,6 @@ pub struct Finding {
     pub confidence: Confidence,
     pub rule: String,
     pub reason: String,
-    /// For installed programs: the command that starts their own uninstaller.
+    /// For installed programs: the command or `ms-settings:` link that starts their removal.
     pub uninstall: Option<String>,
 }

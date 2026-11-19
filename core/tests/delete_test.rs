@@ -1,4 +1,5 @@
-use deox_core::delete::{delete, launch_uninstaller, Outcome};
+use deox_core::delete::{delete, delete_with_progress, launch_uninstaller, Outcome};
+use deox_core::scan::Cancel;
 use deox_core::report::{Category, Confidence, Finding, Report};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -265,4 +266,21 @@ fn finding_stub() -> Finding {
         reason: "r".into(),
         uninstall: None,
     }
+}
+
+#[test]
+fn cancelled_run_leaves_unhandled_items_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let _cleanup = BinCleanup(dir.path());
+    let file = dir.path().join("kept.tmp");
+    write(&file, b"keep");
+    let cancel = Cancel::default();
+    cancel.cancel();
+
+    let report = delete_with_progress(&[finding(&file)], false, &dir.path().join("actions.log"), &|_, _| {}, &cancel).unwrap();
+
+    assert!(report.cancelled);
+    assert_eq!(report.not_attempted, 1);
+    assert!(report.entries.is_empty());
+    assert!(file.exists());
 }

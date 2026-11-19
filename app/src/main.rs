@@ -52,6 +52,13 @@ struct DeoxApp {
     files_seen: u64,
     /// Items settled and total while a move or check is running.
     move_progress: (usize, usize),
+    move_cancel: Arc<Cancel>,
+    /// Narrows the result list to names and paths containing this text.
+    filter: String,
+    /// Per finding: whether it passes the current filter.
+    visible: Vec<bool>,
+    /// The folder the scan reported most recently.
+    scan_folder: String,
     results: Option<Results>,
     rows: Vec<Row>,
     collapsed: HashSet<Category>,
@@ -79,6 +86,10 @@ impl DeoxApp {
             status: String::new(),
             files_seen: 0,
             move_progress: (0, 0),
+            move_cancel: Arc::new(Cancel::default()),
+            filter: String::new(),
+            visible: Vec::new(),
+            scan_folder: String::new(),
             results: None,
             rows: Vec::new(),
             collapsed: HashSet::new(),
@@ -114,6 +125,7 @@ impl DeoxApp {
         self.cancel = Arc::new(Cancel::default());
         self.phase = Phase::Scanning;
         self.files_seen = 0;
+        self.scan_folder.clear();
         self.status = "Starting scan…".into();
         self.results = None;
         self.rows.clear();
@@ -124,8 +136,9 @@ impl DeoxApp {
     fn begin_delete(&mut self, findings: Vec<Finding>, dry_run: bool) {
         self.phase = Phase::Deleting;
         self.move_progress = (0, findings.len());
+        self.move_cancel = Arc::new(Cancel::default());
         self.status = if dry_run { "Checking the selected items…".into() } else { "Moving the selected items to the Recycle Bin…".into() };
-        worker::spawn_delete(findings, dry_run, self.notifier());
+        worker::spawn_delete(findings, dry_run, self.move_cancel.clone(), self.notifier());
     }
 
     fn set_results(&mut self, findings: Vec<Finding>, files: u64, unreadable: usize) {
@@ -139,14 +152,20 @@ impl DeoxApp {
     fn rebuild_rows(&mut self) {
         self.rows.clear();
         let Some(results) = &self.results else { return };
+        let needle = self.filter.trim().to_lowercase();
+        self.visible = results.report.findings.iter().map(|f| matches_filter(f, &needle)).collect();
         for group in results.report.groups() {
+            let shown: Vec<(usize, &Finding)> = group.items.iter().filter(|(i, _)| self.visible[*i]).copied().collect();
+            if shown.is_empty() {
+                continue;
+            }
             self.rows.push(Row::Header {
                 category: group.category,
-                total: group.total_size,
-                count: group.items.len(),
+                total: shown.iter().map(|(_, f)| f.size).sum(),
+                count: shown.len(),
             });
             if !self.collapsed.contains(&group.category) {
-                self.rows.extend(group.items.iter().map(|(i, _)| Row::Item(*i)));
+                self.rows.extend(shown.iter().map(|(i, _)| Row::Item(*i)));
             }
         }
     }
@@ -155,6 +174,7 @@ impl DeoxApp {
         match msg {
             Msg::Status(s) => self.status = s,
             Msg::Progress(n) => self.files_seen = n,
+            Msg::Folder(folder) => self.scan_folder = folder,
             Msg::Moved(done, total) => self.move_progress = (done, total),
             Msg::Analysis(a) => {
                 self.phase = Phase::Idle;
@@ -293,6 +313,9 @@ impl DeoxApp {
                 if self.phase == Phase::Scanning {
                     ui.label(RichText::new(&self.scan_root).weak());
                     ui.label(format!("{} files checked so far", self.files_seen));
+                    if !self.scan_folder.is_empty() {
+                        ui.add(egui::Label::new(RichText::new(&self.scan_folder).weak().small()).truncate());
+                    }
                     ui.add_space(8.0);
                     ui.label(RichText::new("Large drives can take several minutes. You can cancel at any time.").weak());
                 } else {
@@ -302,6 +325,11 @@ impl DeoxApp {
                         ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0).text(format!("{done} of {total}")));
                         ui.add_space(8.0);
                         ui.label(RichText::new("Many small files take a few minutes. Please keep Deox open.").weak());
+                        ui.add_space(8.0);
+                        if ui.button("Stop after this batch").clicked() {
+                            self.move_cancel.cancel();
+                            self.status = "Stopping…".into();
+                        }
                     }
                 }
             });
@@ -365,6 +393,22 @@ impl DeoxApp {
         }
         ui.separator();
 
+        let mut filter_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let field = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(240.0).hint_text("name or path"));
+            filter_changed = field.changed();
+            if !self.filter.is_empty() && ui.button("Clear").clicked() {
+                self.filter.clear();
+                filter_changed = true;
+            }
+        });
+        let select_visible = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) && !ui.ctx().egui_wants_keyboard_input();
+        if self.rows.is_empty() && !self.filter.trim().is_empty() {
+            ui.add_space(8.0);
+            ui.label(format!("Nothing matches \"{}\".", self.filter.trim()));
+        }
+
         let row_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + ui.spacing().item_spacing.y * 2.0;
         let dark = ui.visuals().dark_mode;
         let mut toggled = None;
@@ -379,7 +423,7 @@ impl DeoxApp {
                             .findings
                             .iter()
                             .enumerate()
-                            .filter(|(_, f)| f.category == *category && f.confidence != Confidence::Info)
+                            .filter(|(i, f)| f.category == *category && f.confidence != Confidence::Info && self.visible[*i])
                             .fold((0, 0), |(c, t), (i, _)| (c + usize::from(self.selected.contains(&i)), t + 1));
                         ui.horizontal(|ui| {
                             ui.set_min_height(row_height);
@@ -456,13 +500,21 @@ impl DeoxApp {
             }
         });
         if let (Some((category, on)), Some(results)) = (category_select, &self.results) {
-            for (i, _) in results.report.findings.iter().enumerate().filter(|(_, f)| f.category == category && f.confidence != Confidence::Info) {
+            for (i, _) in results.report.findings.iter().enumerate().filter(|(i, f)| f.category == category && f.confidence != Confidence::Info && self.visible[*i]) {
                 if on {
                     self.selected.insert(i);
                 } else {
                     self.selected.remove(&i);
                 }
             }
+        }
+        if select_visible {
+            for (i, _) in results.report.findings.iter().enumerate().filter(|(i, f)| f.confidence != Confidence::Info && self.visible[*i]) {
+                self.selected.insert(i);
+            }
+        }
+        if filter_changed {
+            self.rebuild_rows();
         }
         if let Some(category) = toggled {
             if !self.collapsed.remove(&category) {
@@ -478,33 +530,62 @@ impl DeoxApp {
     fn dialogs(&mut self, ctx: &egui::Context) {
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if self.confirm_delete {
-            let findings = self.selected_findings();
-            let total: u64 = findings.iter().map(|f| f.size).sum();
+            let mut summary: Vec<(Category, usize, u64)> = Vec::new();
+            let mut total = 0;
+            let mut count = 0;
+            if let Some(results) = &self.results {
+                for f in self.selected.iter().filter_map(|i| results.report.findings.get(*i)) {
+                    total += f.size;
+                    count += 1;
+                    match summary.iter_mut().find(|(c, _, _)| *c == f.category) {
+                        Some(row) => {
+                            row.1 += 1;
+                            row.2 += f.size;
+                        }
+                        None => summary.push((f.category, 1, f.size)),
+                    }
+                }
+            }
+            summary.sort_by_key(|(_, _, size)| std::cmp::Reverse(*size));
             let mut run = false;
             let mut cancel = false;
             let title = if self.dry_run { "Check before moving" } else { "Move to Recycle Bin?" };
             egui::Window::new(title).collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.set_width(640.0);
-                ui.label(format!("{} ({}) will be moved to the Recycle Bin. You can restore them from there.", items(findings.len()), human(total)));
+                ui.label(format!("{} ({}) will be moved to the Recycle Bin. You can restore them from there.", items(count), human(total)));
                 ui.label("Anything that changed since the scan, or sits in a protected location, is skipped.");
                 ui.add_space(6.0);
-                egui::ScrollArea::vertical().max_height(300.0).show_rows(ui, 18.0, findings.len(), |ui, range| {
-                    for f in &findings[range] {
-                        ui.add(egui::Label::new(format!("{:>10}  {}", human(f.size), f.path.display())).truncate());
-                    }
+                for (category, n, size) in &summary {
+                    ui.horizontal(|ui| {
+                        cell(ui, SIZE_W, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(human(*size)).monospace());
+                        });
+                        ui.label(format!("{}  ·  {}", category_name(*category), items(*n)));
+                    });
+                }
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("Show every item").show(ui, |ui| {
+                    let Some(results) = &self.results else { return };
+                    let mut indices: Vec<usize> = self.selected.iter().copied().collect();
+                    indices.sort_unstable();
+                    egui::ScrollArea::vertical().max_height(260.0).show_rows(ui, 18.0, indices.len(), |ui, range| {
+                        for f in indices[range].iter().filter_map(|i| results.report.findings.get(*i)) {
+                            ui.add(egui::Label::new(format!("{:>10}  {}", human(f.size), f.path.display())).truncate());
+                        }
+                    });
                 });
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.dry_run, "Check only. Move nothing yet.");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let label = if self.dry_run { "Check items".to_string() } else { format!("Move {} to Recycle Bin", items(findings.len())) };
+                    let label = if self.dry_run { "Check items".to_string() } else { format!("Move {} to Recycle Bin", items(count)) };
                     run = ui.button(label).clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
             if run {
                 self.confirm_delete = false;
-                self.begin_delete(findings, self.dry_run);
+                self.begin_delete(self.selected_findings(), self.dry_run);
             } else if cancel || escape {
                 self.confirm_delete = false;
             }
@@ -528,6 +609,9 @@ impl DeoxApp {
                             items(count(|o| *o == Outcome::Deleted)),
                             human(report.freed_bytes())
                         ));
+                    }
+                    if report.cancelled {
+                        ui.label(format!("Stopped early. {} left exactly as they were.", items(report.not_attempted)));
                     }
                     let problems: Vec<_> =
                         report.entries.iter().filter(|e| e.outcome != Outcome::Deleted && e.outcome != Outcome::WouldDelete).collect();
@@ -717,4 +801,11 @@ fn items(n: usize) -> String {
 
 fn paths(n: usize) -> String {
     if n == 1 { "1 path".into() } else { format!("{n} paths") }
+}
+
+/// Case-insensitive match on a finding's path or rule name; an empty filter matches everything.
+fn matches_filter(finding: &Finding, needle: &str) -> bool {
+    needle.is_empty()
+        || finding.path.to_string_lossy().to_lowercase().contains(needle)
+        || finding.rule.to_lowercase().contains(needle)
 }

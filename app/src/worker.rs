@@ -6,7 +6,7 @@ use deox_core::dupes::find_duplicates;
 use deox_core::programs::{installed_programs, AppxRegistry, BloatwareList, WindowsRegistry};
 use deox_core::report::Finding;
 use deox_core::rules::Rules;
-use deox_core::scan::{scan, Cancel};
+use deox_core::scan::{scan_with_folders, Cancel};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -26,6 +26,8 @@ pub struct Analysis {
 pub enum Msg {
     Status(String),
     Progress(u64),
+    /// The folder the scan is currently walking.
+    Folder(String),
     /// Items settled so far and the total, while moving to the Recycle Bin.
     Moved(usize, usize),
     Analysis(Analysis),
@@ -68,7 +70,7 @@ pub fn spawn_analysis(root: PathBuf, cancel: Arc<Cancel>, notify: Notifier) {
     });
 }
 
-pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, notify: Notifier) {
+pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, cancel: Arc<Cancel>, notify: Notifier) {
     run_job(notify, move |notify| {
         let Some(log) = default_log_path() else {
             return notify.send(Msg::Failed("Deox can't find a folder for its action log, so nothing was moved.".into()));
@@ -79,7 +81,7 @@ pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, notify: Notifier) {
                 notify.send(Msg::Moved(done, total));
             }
         };
-        match delete_with_progress(&findings, dry_run, &log, &report_progress) {
+        match delete_with_progress(&findings, dry_run, &log, &report_progress, &cancel) {
             Ok(report) => notify.send(Msg::Deleted(report)),
             Err(e) => notify.send(Msg::Failed(format!(
                 "The move could not finish: {e:#}\nSome items may already be in the Recycle Bin. Scan again to refresh the list."
@@ -89,12 +91,24 @@ pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, notify: Notifier) {
 }
 
 fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow::Result<Analysis> {
-    notify.send(Msg::Status("Scanning files…".into()));
-    let index = scan(root, cancel, |seen| {
-        if seen % 512 == 0 {
-            notify.send(Msg::Progress(seen));
-        }
-    });
+    notify.send(Msg::Status("Step 1 of 4: scanning files…".into()));
+    let mut folders = 0u32;
+    let index = scan_with_folders(
+        root,
+        cancel,
+        |seen| {
+            if seen.is_multiple_of(512) {
+                notify.send(Msg::Progress(seen));
+            }
+        },
+        |folder| {
+            // Folders are far more frequent than the window needs to redraw.
+            folders = folders.wrapping_add(1);
+            if folders.is_multiple_of(200) {
+                notify.send(Msg::Folder(folder.display().to_string()));
+            }
+        },
+    );
     let files = index.files.len() as u64;
     let mut unreadable = index.errors.len();
     let cancelled = |findings| Analysis { findings, files, unreadable, cancelled: true };
@@ -103,12 +117,12 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
     }
 
     notify.send(Msg::Progress(files));
-    notify.send(Msg::Status("Applying cleanup rules…".into()));
+    notify.send(Msg::Status("Step 2 of 4: applying cleanup rules…".into()));
     let mut findings = Rules::builtin()?.evaluate(&index, SystemTime::now());
 
-    notify.send(Msg::Status("Looking for duplicate files…".into()));
+    notify.send(Msg::Status("Step 3 of 4: looking for duplicate files…".into()));
     let dupes = find_duplicates(&index, cancel, MIN_DUPLICATE_SIZE, &|stage, done, total| {
-        notify.send(Msg::Status(format!("{stage}… {done} of {total}")));
+        notify.send(Msg::Status(format!("Step 3 of 4: {}… {done} of {total}", stage.to_lowercase())));
     });
     if dupes.cancelled {
         return Ok(cancelled(Vec::new()));
@@ -116,7 +130,7 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
     unreadable += dupes.errors.len();
     findings.extend(dupes.groups.iter().flat_map(|g| g.findings()));
 
-    notify.send(Msg::Status("Reading installed programs…".into()));
+    notify.send(Msg::Status("Step 4 of 4: reading installed programs…".into()));
     let mut programs = installed_programs(&WindowsRegistry);
     programs.extend(installed_programs(&AppxRegistry));
     findings.extend(BloatwareList::builtin()?.evaluate(&programs));

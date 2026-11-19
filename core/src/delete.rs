@@ -3,6 +3,7 @@
 
 use crate::protect::is_protected;
 use crate::report::{Category, Confidence, Finding};
+use crate::scan::Cancel;
 use anyhow::{anyhow, bail, Context, Result};
 use directories::ProjectDirs;
 use std::fs::{self, OpenOptions};
@@ -51,6 +52,10 @@ pub struct DeleteEntry {
 #[derive(Default)]
 pub struct DeleteReport {
     pub entries: Vec<DeleteEntry>,
+    /// The run was stopped by the user before every item was handled.
+    pub cancelled: bool,
+    /// Items left untouched because of the cancellation.
+    pub not_attempted: usize,
 }
 
 impl DeleteReport {
@@ -68,7 +73,7 @@ pub fn default_log_path() -> Option<PathBuf> {
 /// (time, result, size, path). With `dry_run` nothing is touched and nothing is logged.
 /// If the log cannot be opened or written, deletion stops: no action goes unrecorded.
 pub fn delete(findings: &[Finding], dry_run: bool, log: &Path) -> Result<DeleteReport> {
-    delete_with_progress(findings, dry_run, log, &|_, _| {})
+    delete_with_progress(findings, dry_run, log, &|_, _| {}, &Cancel::default())
 }
 
 /// Items handed to the Recycle Bin in one system call. One call per item costs tens of
@@ -81,6 +86,7 @@ pub fn delete_with_progress(
     dry_run: bool,
     log: &Path,
     progress: &dyn Fn(usize, usize),
+    cancel: &Cancel,
 ) -> Result<DeleteReport> {
     let mut log_file = if dry_run { None } else { Some(open_log(log)?) };
     let total = findings.len();
@@ -105,7 +111,12 @@ pub fn delete_with_progress(
         Ok(())
     };
 
+    let mut cancelled = false;
     for (i, finding) in findings.iter().enumerate() {
+        if cancel.is_cancelled() {
+            cancelled = true;
+            break;
+        }
         match check(finding, dry_run) {
             Err(outcome) => settle(i, outcome, &mut outcomes)?,
             Ok(()) => pending.push(i),
@@ -116,16 +127,20 @@ pub fn delete_with_progress(
             }
         }
     }
-    for (j, outcome) in trash_batch(findings, &pending) {
-        settle(j, outcome, &mut outcomes)?;
+    // Items checked but not yet handed to the Recycle Bin stay where they are when cancelled.
+    if !cancelled {
+        for (j, outcome) in trash_batch(findings, &pending) {
+            settle(j, outcome, &mut outcomes)?;
+        }
     }
 
-    let entries = findings
+    let entries: Vec<DeleteEntry> = findings
         .iter()
         .zip(outcomes)
-        .map(|(f, outcome)| DeleteEntry { path: f.path.clone(), size: f.size, outcome: outcome.unwrap_or(Outcome::Missing) })
+        .filter_map(|(f, outcome)| outcome.map(|outcome| DeleteEntry { path: f.path.clone(), size: f.size, outcome }))
         .collect();
-    Ok(DeleteReport { entries })
+    let not_attempted = total - entries.len();
+    Ok(DeleteReport { entries, cancelled, not_attempted })
 }
 
 /// Moves the items in one call. If the system rejects the batch, each item is tried alone so

@@ -41,7 +41,17 @@ pub struct Index {
 /// Links and junctions are not entered. Unreadable entries are recorded in
 /// `Index::errors` and never abort the scan.
 /// `progress` receives the number of files indexed so far, once per file.
-pub fn scan(root: &Path, cancel: &Cancel, mut progress: impl FnMut(u64)) -> Index {
+pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64)) -> Index {
+    scan_with_folders(root, cancel, progress, |_| {})
+}
+
+/// Like [`scan`], and also calls `on_folder` with every folder the walk enters.
+pub fn scan_with_folders(
+    root: &Path,
+    cancel: &Cancel,
+    mut progress: impl FnMut(u64),
+    mut on_folder: impl FnMut(&Path),
+) -> Index {
     let mut index = Index::default();
     for entry in jwalk::WalkDir::new(root) {
         if cancel.is_cancelled() {
@@ -58,6 +68,9 @@ pub fn scan(root: &Path, cancel: &Cancel, mut progress: impl FnMut(u64)) -> Inde
         // A directory that could not be listed is reported on the directory entry itself.
         if let Some(e) = entry.read_children.as_ref().and_then(|r| r.error()) {
             index.errors.push(ScanError { path: Some(entry.path()), message: e.to_string() });
+        }
+        if entry.file_type().is_dir() {
+            on_folder(&entry.path());
         }
         if !entry.file_type().is_file() {
             continue;

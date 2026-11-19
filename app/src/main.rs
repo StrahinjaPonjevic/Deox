@@ -623,9 +623,20 @@ impl DeoxApp {
                     if !problems.is_empty() {
                         ui.add_space(6.0);
                         ui.label(format!("{} skipped:", items(problems.len())));
+                        if problems.iter().any(|e| matches!(e.outcome, Outcome::Failed(_))) {
+                            ui.label(RichText::new("Windows refused some items, usually because a program is using them. Close browsers, chat apps and editors, then scan and try again.").weak());
+                        }
                         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                            for e in problems {
-                                ui.add(egui::Label::new(format!("{}  {}", describe(&e.outcome), e.path.display())).truncate());
+                            for e in problems.iter().take(MAX_LISTED_SKIPS) {
+                                let reason = ui.add(egui::Label::new(RichText::new(describe(&e.outcome)).strong()));
+                                if let Outcome::Failed(why) = &e.outcome {
+                                    reason.on_hover_text(why);
+                                }
+                                ui.add(egui::Label::new(RichText::new(e.path.display().to_string()).weak()).wrap());
+                                ui.add_space(4.0);
+                            }
+                            if problems.len() > MAX_LISTED_SKIPS {
+                                ui.label(format!("…and {} more. All of them are in the action log.", items(problems.len() - MAX_LISTED_SKIPS)));
                             }
                         });
                     }
@@ -766,7 +777,7 @@ fn describe(outcome: &Outcome) -> String {
         Outcome::NotDeletable => "Can't be removed".into(),
         Outcome::Missing => "Already gone".into(),
         Outcome::Changed => "Changed since the scan".into(),
-        Outcome::Failed(why) => format!("Failed: {why}"),
+        Outcome::Failed(_) => "Windows refused to move it (hover for the technical detail)".into(),
     }
 }
 
@@ -786,6 +797,8 @@ fn share_bar(ui: &mut egui::Ui, part: u64, whole: u64) {
     response.on_hover_text(format!("{:.0}% of what could be freed", share * 100.0));
 }
 
+/// Rows shown in the list of skipped items; longer lists are summarized.
+const MAX_LISTED_SKIPS: usize = 200;
 const CHECK_W: f32 = 24.0;
 const TAG_W: f32 = 52.0;
 const SIZE_W: f32 = 76.0;

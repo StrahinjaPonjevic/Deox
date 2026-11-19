@@ -91,7 +91,8 @@ impl DeoxApp {
     }
 
     fn start_scan(&mut self) {
-        let mut root = self.root.trim().to_string();
+        // "Copy as path" in Explorer wraps the path in quotes.
+        let mut root = self.root.trim().trim_matches('"').trim().to_string();
         if root.ends_with(':') {
             root.push('\\');
         }
@@ -190,10 +191,13 @@ impl DeoxApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Folder or drive:");
-            ui.add_enabled(
+            let field = ui.add_enabled(
                 idle,
                 egui::TextEdit::singleline(&mut self.root).desired_width(360.0).hint_text(r"C:\Users\you"),
             );
+            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && idle && !self.root.trim().is_empty() {
+                self.start_scan();
+            }
             if ui.add_enabled(idle, egui::Button::new("Browse…")).clicked() {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.root = dir.display().to_string();
@@ -362,6 +366,7 @@ impl DeoxApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if self.confirm_delete {
             let findings = self.selected_findings();
             let total: u64 = findings.iter().map(|f| f.size).sum();
@@ -392,7 +397,7 @@ impl DeoxApp {
                 self.phase = Phase::Deleting;
                 self.status = if self.dry_run { "Checking the selected items…".into() } else { "Moving the selected items to the Recycle Bin…".into() };
                 worker::spawn_delete(findings, self.dry_run, self.notifier());
-            } else if cancel {
+            } else if cancel || escape {
                 self.confirm_delete = false;
             }
         }
@@ -441,7 +446,7 @@ impl DeoxApp {
                 self.phase = Phase::Deleting;
                 self.status = "Moving the selected items to the Recycle Bin…".into();
                 worker::spawn_delete(self.selected_findings(), false, self.notifier());
-            } else if close {
+            } else if close || escape {
                 self.last_delete = None;
             }
         }
@@ -468,7 +473,7 @@ impl DeoxApp {
                     });
                 });
             }
-            if done {
+            if done || escape {
                 self.pending_uninstall = None;
             }
         }
@@ -481,7 +486,7 @@ impl DeoxApp {
                 ui.add_space(6.0);
                 close = ui.button("Close").clicked();
             });
-            if close {
+            if close || escape {
                 self.error = None;
             }
         }

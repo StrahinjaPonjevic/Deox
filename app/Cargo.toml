@@ -1,0 +1,7 @@
+[package]
+name = "deox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+deox-core = { path = "../core" }

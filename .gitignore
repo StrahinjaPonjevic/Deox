@@ -1,10 +1,5 @@
 .*
 !.gitignore
 target/
-web/pkg/
-node_modules/
-certs/
-*.pem
-*.key
 *.log
 Thumbs.db

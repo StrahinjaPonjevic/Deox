@@ -305,6 +305,7 @@ impl DeoxApp {
         ui.separator();
 
         let row_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + ui.spacing().item_spacing.y * 2.0;
+        let dark = ui.visuals().dark_mode;
         let mut toggled = None;
         let mut category_select: Option<(Category, bool)> = None;
         let mut uninstall = None;
@@ -325,6 +326,7 @@ impl DeoxApp {
                                 let mut on = chosen == selectable;
                                 let partial = chosen > 0 && chosen < selectable;
                                 let check = ui.add(egui::Checkbox::new(&mut on, "").indeterminate(partial));
+                                name_checkbox(&check, on, &format!("Select all in {}", category_name(*category)));
                                 if check.changed() {
                                     category_select = Some((*category, on));
                                 }
@@ -353,7 +355,9 @@ impl DeoxApp {
                             cell(ui, CHECK_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 if finding.confidence != Confidence::Info {
                                     let mut on = self.selected.contains(i);
-                                    if ui.checkbox(&mut on, "").changed() {
+                                    let check = ui.checkbox(&mut on, "");
+                                    name_checkbox(&check, on, &format!("{name} ({})", human(finding.size)));
+                                    if check.changed() {
                                         if on {
                                             self.selected.insert(*i);
                                         } else {
@@ -362,9 +366,9 @@ impl DeoxApp {
                                     }
                                 }
                             });
-                            let (tag, color) = confidence_tag(finding.confidence);
+                            let (tag, color, meaning) = confidence_tag(finding.confidence, dark);
                             cell(ui, TAG_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(tag).color(color).strong());
+                                ui.label(RichText::new(tag).color(color).strong()).on_hover_text(meaning);
                             });
                             cell(ui, SIZE_W, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(RichText::new(human(finding.size)).monospace());
@@ -580,12 +584,30 @@ fn category_name(category: Category) -> &'static str {
     }
 }
 
-fn confidence_tag(confidence: Confidence) -> (&'static str, Color32) {
+/// Label, color and meaning of a safety level. Colors keep at least 4.5:1 against the panel in both themes.
+fn confidence_tag(confidence: Confidence, dark: bool) -> (&'static str, Color32, &'static str) {
+    let pick = |dark_rgb: [u8; 3], light_rgb: [u8; 3]| {
+        let [r, g, b] = if dark { dark_rgb } else { light_rgb };
+        Color32::from_rgb(r, g, b)
+    };
     match confidence {
-        Confidence::Safe => ("Safe", Color32::from_rgb(46, 160, 67)),
-        Confidence::Review => ("Review", Color32::from_rgb(210, 153, 34)),
-        Confidence::Info => ("Info", Color32::from_rgb(110, 118, 129)),
+        Confidence::Safe => ("Safe", pick([92, 205, 128], [17, 107, 43]), "Regenerated automatically. Selected by default."),
+        Confidence::Review => (
+            "Review",
+            pick([232, 183, 70], [133, 84, 0]),
+            "Probably not needed, but check it first. Never selected by default.",
+        ),
+        Confidence::Info => (
+            "Info",
+            pick([158, 166, 178], [84, 91, 103]),
+            "An installed program. Deox only reports it; removal goes through the program's own uninstaller.",
+        ),
     }
+}
+
+/// Gives a checkbox without visible text a name for screen readers.
+fn name_checkbox(check: &egui::Response, on: bool, name: &str) {
+    check.widget_info(|| egui::WidgetInfo::selected(egui::accesskit::Role::CheckBox, true, on, name));
 }
 
 fn describe(outcome: &Outcome) -> String {

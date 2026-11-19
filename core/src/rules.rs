@@ -84,7 +84,7 @@ impl Rules {
             let path = glob_str(&file.path);
             if let Some(rule) = file_rules.iter().find(|r| r.matcher.is_match(&path)) {
                 if old_enough(file.modified, rule) && !is_protected(&file.path) {
-                    findings.push(finding(rule, file.path.clone(), file.size));
+                    findings.push(finding(rule, file.path.clone(), file.size, file.modified));
                 }
             }
         }
@@ -95,7 +95,7 @@ impl Rules {
             // Active if the artifact itself or anything beside it changed recently.
             let beside = root.parent().and_then(|p| activity.get(p).copied().flatten());
             if old_enough(beside.max(a.newest), a.rule) && !is_protected(&root) {
-                findings.push(finding(a.rule, root, a.size));
+                findings.push(finding(a.rule, root, a.size, None));
             }
         }
         findings
@@ -143,10 +143,11 @@ fn project_activity(index: &Index, artifacts: &HashMap<PathBuf, Artifact>) -> Ha
     activity
 }
 
-fn finding(rule: &Rule, path: PathBuf, size: u64) -> Finding {
+fn finding(rule: &Rule, path: PathBuf, size: u64, modified: Option<SystemTime>) -> Finding {
     Finding {
         path,
         size,
+        modified,
         category: rule.category,
         confidence: rule.confidence,
         rule: rule.name.clone(),

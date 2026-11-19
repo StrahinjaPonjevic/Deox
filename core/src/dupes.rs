@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// Bytes hashed before committing to a full read of a file.
 const PARTIAL_BYTES: u64 = 64 * 1024;
@@ -17,7 +18,13 @@ const PARTIAL_BYTES: u64 = 64 * 1024;
 pub struct DupeGroup {
     pub size: u64,
     /// The first entry is the copy that is kept; only the others are ever offered.
-    pub files: Vec<PathBuf>,
+    pub files: Vec<DupeFile>,
+}
+
+/// A copy as it was when scanned; deletion re-checks it against the disk.
+pub struct DupeFile {
+    pub path: PathBuf,
+    pub modified: Option<SystemTime>,
 }
 
 #[derive(Default)]
@@ -54,13 +61,14 @@ pub fn find_duplicates(index: &Index, cancel: &Cancel) -> Duplicates {
 impl DupeGroup {
     /// Every copy except the kept one that may be deleted. Protected paths are left out.
     pub fn findings(&self) -> Vec<Finding> {
-        let kept = &self.files[0];
+        let kept = &self.files[0].path;
         self.files[1..]
             .iter()
-            .filter(|path| !is_protected(path))
-            .map(|path| Finding {
-                path: path.clone(),
+            .filter(|f| !is_protected(&f.path))
+            .map(|f| Finding {
+                path: f.path.clone(),
                 size: self.size,
+                modified: f.modified,
                 category: Category::Duplicate,
                 confidence: Confidence::Review,
                 rule: "Duplicate files".to_string(),
@@ -77,7 +85,10 @@ fn group(files: Vec<&FileEntry>) -> DupeGroup {
     let size = files[0].size;
     let mut files = files;
     files.sort_by_cached_key(|f| (!is_protected(&f.path), f.modified, f.path.clone()));
-    DupeGroup { size, files: files.into_iter().map(|f| f.path.clone()).collect() }
+    DupeGroup {
+        size,
+        files: files.into_iter().map(|f| DupeFile { path: f.path.clone(), modified: f.modified }).collect(),
+    }
 }
 
 /// Hashes files in parallel and keeps only the groups that still hold two or more.

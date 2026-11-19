@@ -87,7 +87,7 @@ fn at_least_one_copy_always_remains() {
     let findings = group.findings();
 
     assert_eq!(findings.len(), 2);
-    assert!(findings.iter().all(|f| f.path != group.files[0]));
+    assert!(findings.iter().all(|f| f.path != group.files[0].path));
     assert!(findings.iter().all(|f| f.category == Category::Duplicate && f.confidence == Confidence::Review));
     assert!(findings.iter().all(|f| f.size == 12 && !f.reason.is_empty()));
 }

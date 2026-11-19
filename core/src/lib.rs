@@ -1,3 +1,4 @@
+pub mod delete;
 pub mod dupes;
 pub mod programs;
 pub mod protect;

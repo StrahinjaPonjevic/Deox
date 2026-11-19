@@ -196,6 +196,7 @@ impl BloatwareList {
                 Some(Finding {
                     path: p.install_location.clone().unwrap_or_default(),
                     size: p.size.unwrap_or(0),
+                    modified: None,
                     category: Category::Bloatware,
                     confidence: Confidence::Info,
                     rule: rule.name.clone(),

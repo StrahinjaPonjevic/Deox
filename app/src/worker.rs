@@ -75,7 +75,7 @@ pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, notify: Notifier) {
         };
         let report_progress = |done: usize, total: usize| {
             // Thousands of small items would otherwise flood the window with messages.
-            if done == total || done % 25 == 0 {
+            if done == total || done.is_multiple_of(25) {
                 notify.send(Msg::Moved(done, total));
             }
         };

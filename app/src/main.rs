@@ -14,10 +14,38 @@ use worker::{Msg, Notifier};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]).with_title("Deox"),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 700.0])
+            .with_min_inner_size([780.0, 520.0])
+            .with_title("Deox"),
         ..Default::default()
     };
-    eframe::run_native("Deox", options, Box::new(|cc| Ok(Box::new(DeoxApp::new(cc.egui_ctx.clone())))))
+    eframe::run_native(
+        "Deox",
+        options,
+        Box::new(|cc| {
+            configure_theme(&cc.egui_ctx);
+            Ok(Box::new(DeoxApp::new(cc.egui_ctx.clone())))
+        }),
+    )
+}
+
+/// Darkens or lightens the default text so that even the dim text used for reasons and paths
+/// keeps at least 4.5:1 against the panel in both themes (egui's own defaults give about 2.7:1).
+fn configure_theme(ctx: &egui::Context) {
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(180);
+        style.visuals.weak_text_alpha = 0.7;
+    });
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(60);
+        style.visuals.weak_text_alpha = 0.8;
+    });
+}
+
+/// Keeps a dialog inside a narrow window.
+fn dialog_width(ctx: &egui::Context, wanted: f32) -> f32 {
+    wanted.min(ctx.content_rect().width() - 48.0).max(320.0)
 }
 
 #[derive(PartialEq)]
@@ -57,6 +85,12 @@ struct DeoxApp {
     filter: String,
     /// Per finding: whether it passes the current filter.
     visible: Vec<bool>,
+    /// Row highlighted for keyboard control, as a position in `rows`.
+    cursor_row: Option<usize>,
+    /// Scroll offset to apply on the next frame, set when the cursor leaves the view.
+    scroll_to: Option<f32>,
+    /// Last known scroll offset and viewport height of the result list.
+    scroll_state: (f32, f32),
     /// The folder the scan reported most recently.
     scan_folder: String,
     results: Option<Results>,
@@ -89,6 +123,9 @@ impl DeoxApp {
             move_cancel: Arc::new(Cancel::default()),
             filter: String::new(),
             visible: Vec::new(),
+            cursor_row: None,
+            scroll_to: None,
+            scroll_state: (0.0, 0.0),
             scan_folder: String::new(),
             results: None,
             rows: Vec::new(),
@@ -133,6 +170,10 @@ impl DeoxApp {
         worker::spawn_analysis(root, self.cancel.clone(), self.notifier());
     }
 
+    fn modal_open(&self) -> bool {
+        self.confirm_delete || self.last_delete.is_some() || self.pending_uninstall.is_some() || self.error.is_some()
+    }
+
     fn begin_delete(&mut self, findings: Vec<Finding>, dry_run: bool) {
         self.phase = Phase::Deleting;
         self.move_progress = (0, findings.len());
@@ -168,6 +209,7 @@ impl DeoxApp {
                 self.rows.extend(shown.iter().map(|(i, _)| Row::Item(*i)));
             }
         }
+        self.cursor_row = self.cursor_row.filter(|c| *c < self.rows.len());
     }
 
     fn handle(&mut self, msg: Msg) {
@@ -415,12 +457,68 @@ impl DeoxApp {
         }
 
         let row_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + ui.spacing().item_spacing.y * 2.0;
+        let row_pitch = row_height + ui.spacing().item_spacing.y;
+        let mut key_action: Option<usize> = None;
+        let mut key_enter = false;
+        if !self.modal_open() {
+            if let Some(id) = ui.memory(|m| m.focused()) {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    ui.memory_mut(|m| m.surrender_focus(id));
+                }
+            } else if !ui.ctx().egui_wants_keyboard_input() && !self.rows.is_empty() {
+                let none = egui::Modifiers::NONE;
+                let (down, up, home, end, space, enter) = ui.input_mut(|i| {
+                    (
+                        i.consume_key(none, egui::Key::ArrowDown),
+                        i.consume_key(none, egui::Key::ArrowUp),
+                        i.consume_key(none, egui::Key::Home),
+                        i.consume_key(none, egui::Key::End),
+                        i.consume_key(none, egui::Key::Space),
+                        i.consume_key(none, egui::Key::Enter),
+                    )
+                });
+                let last = self.rows.len() - 1;
+                let current = self.cursor_row;
+                let moved_to = if down {
+                    Some(current.map_or(0, |c| (c + 1).min(last)))
+                } else if up {
+                    Some(current.map_or(0, |c| c.saturating_sub(1)))
+                } else if home {
+                    Some(0)
+                } else if end {
+                    Some(last)
+                } else {
+                    None
+                };
+                if let Some(target) = moved_to {
+                    self.cursor_row = Some(target);
+                    let (offset, height) = self.scroll_state;
+                    let top = target as f32 * row_pitch;
+                    if top < offset {
+                        self.scroll_to = Some(top);
+                    } else if top + row_pitch > offset + height {
+                        self.scroll_to = Some(top + row_pitch - height);
+                    }
+                }
+                if (space || enter) && current.is_some() {
+                    key_action = current;
+                    key_enter = enter;
+                }
+            }
+        }
+        let cursor = self.cursor_row;
         let dark = ui.visuals().dark_mode;
         let mut toggled = None;
         let mut category_select: Option<(Category, bool)> = None;
         let mut uninstall = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_height, self.rows.len(), |ui, range| {
-            for row in &self.rows[range] {
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if let Some(y) = self.scroll_to.take() {
+            area = area.vertical_scroll_offset(y);
+        }
+        let output = area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
+            for (pos, row) in (range.start..).zip(&self.rows[range]) {
+                let highlight = ui.painter().add(egui::Shape::Noop);
+                let row_top = ui.cursor().min.y;
                 match row {
                     Row::Header { category, total, count } => {
                         let (chosen, selectable) = results
@@ -444,9 +542,11 @@ impl DeoxApp {
                             } else {
                                 ui.add_space(CHECK_W);
                             }
-                            let arrow = if self.collapsed.contains(category) { "▶" } else { "▼" };
-                            let text = format!("{arrow} {}  ·  {}  ·  {}", category_name(*category), items(*count), human(*total));
-                            if ui.add(egui::Button::new(RichText::new(text).strong()).frame(false)).clicked() {
+                            let open = !self.collapsed.contains(category);
+                            let text = format!("{}  ·  {}  ·  {}", category_name(*category), items(*count), human(*total));
+                            let icon = disclosure_icon(ui, open);
+                            let label = ui.add(egui::Button::new(RichText::new(text).strong()).frame(false));
+                            if icon.clicked() || label.clicked() {
                                 toggled = Some(*category);
                             }
                             if selectable > 0 {
@@ -502,8 +602,39 @@ impl DeoxApp {
                         });
                     }
                 }
+                if cursor == Some(pos) {
+                    let rect = egui::Rect::from_min_max(egui::pos2(ui.max_rect().left(), row_top), egui::pos2(ui.max_rect().right(), ui.cursor().min.y));
+                    ui.painter().set(highlight, egui::Shape::rect_filled(rect, 3.0, ui.visuals().selection.bg_fill.gamma_multiply(0.45)));
+                }
             }
         });
+        self.scroll_state = (output.state.clamped_offset().y, output.inner_rect.height());
+        if let Some(pos) = key_action {
+            match self.rows.get(pos) {
+                Some(Row::Item(i)) if results.report.findings[*i].confidence != Confidence::Info => {
+                    if !self.selected.remove(i) {
+                        self.selected.insert(*i);
+                    }
+                }
+                Some(Row::Header { category, .. }) => {
+                    if key_enter {
+                        toggled = Some(*category);
+                    } else {
+                        let (chosen, selectable) = results
+                            .report
+                            .findings
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, f)| f.category == *category && f.confidence != Confidence::Info && self.visible[*i])
+                            .fold((0, 0), |(c, t), (i, _)| (c + usize::from(self.selected.contains(&i)), t + 1));
+                        if selectable > 0 {
+                            category_select = Some((*category, chosen < selectable));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if let (Some((category, on)), Some(results)) = (category_select, &self.results) {
             for (i, _) in results.report.findings.iter().enumerate().filter(|(i, f)| f.category == category && f.confidence != Confidence::Info && self.visible[*i]) {
                 if on {
@@ -556,7 +687,7 @@ impl DeoxApp {
             let mut cancel = false;
             let title = if self.dry_run { "Check before moving" } else { "Move to Recycle Bin?" };
             egui::Window::new(title).collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.set_width(640.0);
+                ui.set_width(dialog_width(ctx, 640.0));
                 ui.label(format!("{} ({}) will be moved to the Recycle Bin. You can restore them from there.", items(count), human(total)));
                 ui.label("Anything that changed since the scan, or sits in a protected location, is skipped.");
                 ui.add_space(6.0);
@@ -603,7 +734,7 @@ impl DeoxApp {
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.set_width(640.0);
+                    ui.set_width(dialog_width(ctx, 640.0));
                     let count = |o: fn(&Outcome) -> bool| report.entries.iter().filter(|e| o(&e.outcome)).count();
                     let ready = count(|o| *o == Outcome::WouldDelete);
                     if *dry_run {
@@ -662,7 +793,7 @@ impl DeoxApp {
             let mut done = finding.is_none();
             if let Some(finding) = finding {
                 egui::Window::new("Open uninstaller").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                    ui.set_width(520.0);
+                    ui.set_width(dialog_width(ctx, 520.0));
                     ui.label(&finding.reason);
                     ui.label("Deox only starts the program's own uninstaller. It removes nothing itself.");
                     ui.add_space(6.0);
@@ -687,7 +818,7 @@ impl DeoxApp {
         if let Some(message) = &self.error {
             let mut close = false;
             egui::Window::new("Couldn't complete that").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.set_width(480.0);
+                ui.set_width(dialog_width(ctx, 480.0));
                 ui.label(message);
                 ui.add_space(6.0);
                 close = ui.button("Close").clicked();
@@ -819,6 +950,21 @@ fn items(n: usize) -> String {
 
 fn paths(n: usize) -> String {
     if n == 1 { "1 path".into() } else { format!("{n} paths") }
+}
+
+
+/// A small triangle that points right when the group is collapsed and down when it is open.
+fn disclosure_icon(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+    let c = rect.center();
+    let points = if open {
+        vec![c + egui::vec2(-5.0, -3.0), c + egui::vec2(5.0, -3.0), c + egui::vec2(0.0, 4.0)]
+    } else {
+        vec![c + egui::vec2(-3.0, -5.0), c + egui::vec2(-3.0, 5.0), c + egui::vec2(4.0, 0.0)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(points, ui.visuals().text_color(), egui::Stroke::NONE));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Expand or collapse group"));
+    response
 }
 
 /// The three safety levels with their meaning, as a short list.

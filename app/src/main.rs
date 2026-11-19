@@ -349,16 +349,7 @@ impl DeoxApp {
             }
             ui.add_space(16.0);
             ui.label(RichText::new("Each suggestion carries a safety level").strong());
-            let dark = ui.visuals().dark_mode;
-            for level in [Confidence::Safe, Confidence::Review, Confidence::Info] {
-                let (tag, color, meaning) = confidence_tag(level, dark);
-                ui.horizontal(|ui| {
-                    cell(ui, TAG_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(tag).color(color).strong());
-                    });
-                    ui.label(meaning);
-                });
-            }
+            legend(ui);
             ui.add_space(16.0);
             ui.label("Deox only suggests. Nothing is removed without your confirmation, and removed items go to the Recycle Bin.");
             if !self.status.is_empty() {
@@ -388,16 +379,30 @@ impl DeoxApp {
                         ))
                         .weak(),
                     );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} selected. Safe items start selected for you; nothing moves until you confirm.",
+                            items(self.selected.len())
+                        ))
+                        .weak(),
+                    );
                 });
             });
+            egui::CollapsingHeader::new("What do Safe, Review and Info mean?").show(ui, legend);
         }
         ui.separator();
 
         let mut filter_changed = false;
         ui.horizontal(|ui| {
             ui.label("Filter:");
-            let field = ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(240.0).hint_text("name or path"));
+            let field = ui
+                .add(egui::TextEdit::singleline(&mut self.filter).desired_width(240.0).hint_text("name or path"))
+                .on_hover_text("Ctrl+A selects everything shown, except installed programs.");
             filter_changed = field.changed();
+            if !self.filter.trim().is_empty() {
+                let shown = self.visible.iter().filter(|v| **v).count();
+                ui.label(RichText::new(format!("{shown} of {} match", self.visible.len())).weak());
+            }
             if !self.filter.is_empty() && ui.button("Clear").clicked() {
                 self.filter.clear();
                 filter_changed = true;
@@ -801,6 +806,20 @@ fn items(n: usize) -> String {
 
 fn paths(n: usize) -> String {
     if n == 1 { "1 path".into() } else { format!("{n} paths") }
+}
+
+/// The three safety levels with their meaning, as a short list.
+fn legend(ui: &mut egui::Ui) {
+    let dark = ui.visuals().dark_mode;
+    for level in [Confidence::Safe, Confidence::Review, Confidence::Info] {
+        let (tag, color, meaning) = confidence_tag(level, dark);
+        ui.horizontal(|ui| {
+            cell(ui, TAG_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.label(RichText::new(tag).color(color).strong());
+            });
+            ui.label(meaning);
+        });
+    }
 }
 
 /// Case-insensitive match on a finding's path or rule name; an empty filter matches everything.

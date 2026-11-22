@@ -31,6 +31,9 @@ fn user_data_folders_are_protected() {
         assert!(is_protected(&home.join(dir).join("a.docx")), "{dir}");
         assert!(is_protected(&home.join(dir)), "{dir}");
     }
+    for item in [r".ssh\id_rsa", r".gnupg\key", r".aws\credentials", "NTUSER.DAT"] {
+        assert!(is_protected(&home.join(item)), "{item}");
+    }
 }
 
 #[test]

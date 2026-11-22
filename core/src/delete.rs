@@ -7,6 +7,7 @@ use crate::scan::Cancel;
 use anyhow::{anyhow, bail, Context, Result};
 use directories::ProjectDirs;
 use std::fs::{self, OpenOptions};
+use std::cell::RefCell;
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -88,7 +89,7 @@ pub fn delete_with_progress(
     progress: &dyn Fn(usize, usize),
     cancel: &Cancel,
 ) -> Result<DeleteReport> {
-    let mut log_file = if dry_run { None } else { Some(open_log(log)?) };
+    let log_file = RefCell::new(if dry_run { None } else { Some(open_log(log)?) });
     let total = findings.len();
     let mut outcomes: Vec<Option<Outcome>> = vec![None; total];
     let mut done = 0;
@@ -99,7 +100,7 @@ pub fn delete_with_progress(
     let mut settle = |i: usize, outcome: Outcome, outcomes: &mut Vec<Option<Outcome>>| -> Result<()> {
         outcomes[i] = Some(outcome);
         done += 1;
-        if let Some(file) = log_file.as_mut() {
+        if let Some(file) = log_file.borrow_mut().as_mut() {
             while let Some(Some(outcome)) = outcomes.get(logged) {
                 let finding = &findings[logged];
                 let line = format!("{}\t{}\t{}\t{}\n", timestamp(), outcome.label(), finding.size, finding.path.display());
@@ -122,13 +123,16 @@ pub fn delete_with_progress(
             Ok(()) => pending.push(i),
         }
         if pending.len() >= TRASH_BATCH {
-            for (j, outcome) in trash_batch(findings, &std::mem::take(&mut pending)) {
+            let batch = std::mem::take(&mut pending);
+            log_pending(&log_file, findings, &batch)?;
+            for (j, outcome) in trash_batch(findings, &batch) {
                 settle(j, outcome, &mut outcomes)?;
             }
         }
     }
     // Items checked but not yet handed to the Recycle Bin stay where they are when cancelled.
     if !cancelled {
+        log_pending(&log_file, findings, &pending)?;
         for (j, outcome) in trash_batch(findings, &pending) {
             settle(j, outcome, &mut outcomes)?;
         }
@@ -141,6 +145,19 @@ pub fn delete_with_progress(
         .collect();
     let not_attempted = total - entries.len();
     Ok(DeleteReport { entries, cancelled, not_attempted })
+}
+
+/// Records the items about to be moved, so a crash during the move still leaves a trace.
+fn log_pending(log_file: &RefCell<Option<fs::File>>, findings: &[Finding], indices: &[usize]) -> Result<()> {
+    if let Some(file) = log_file.borrow_mut().as_mut() {
+        let now = timestamp();
+        let text: String = indices
+            .iter()
+            .map(|&i| format!("{now}\tPENDING\t{}\t{}\n", findings[i].size, findings[i].path.display()))
+            .collect();
+        file.write_all(text.as_bytes()).context("cannot write the action log")?;
+    }
+    Ok(())
 }
 
 /// Moves the items in one call. If the system rejects the batch, each item is tried alone so

@@ -61,6 +61,10 @@ fn zones() -> &'static Zones {
         for dir in ["Documents", "Pictures", "Desktop", "Videos"] {
             protected.push(key_of(&users.join(dir)));
         }
+        // Credentials and the registry hive in the profile are never cleanup material.
+        for item in [".ssh", ".gnupg", ".aws", "NTUSER.DAT"] {
+            protected.push(key_of(&users.join(item)));
+        }
         // Known folders may be redirected into OneDrive, so guard all of it.
         if let Some(onedrive) = env::var_os("OneDrive") {
             protected.push(key_of(Path::new(&onedrive)));

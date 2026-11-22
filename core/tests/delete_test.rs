@@ -193,8 +193,10 @@ fn every_action_is_logged_with_path_size_and_time() {
 
     delete(&findings, false, &log).unwrap();
     let text = fs::read_to_string(&log).unwrap();
-    let lines: Vec<&str> = text.lines().collect();
+    let (pending, lines): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| l.contains("\tPENDING\t"));
 
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].ends_with(&*file.to_string_lossy()));
     assert_eq!(lines.len(), 2);
     let fields: Vec<&str> = lines[0].split('\t').collect();
     assert_eq!(fields.len(), 4);

@@ -35,13 +35,46 @@ fn main() -> eframe::Result {
 /// Darkens or lightens the default text so that even the dim text used for reasons and paths
 /// keeps at least 4.5:1 against the panel in both themes (egui's own defaults give about 2.7:1).
 fn configure_theme(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for (name, bytes, family) in [
+        ("Lato-Light", &include_bytes!("../assets/fonts/Lato-Light.ttf")[..], egui::FontFamily::Proportional),
+        ("JetBrainsMono", &include_bytes!("../assets/fonts/JetBrainsMono.ttf")[..], egui::FontFamily::Monospace),
+    ] {
+        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
+        // Placed first, so the bundled font is used and egui's own remain as fallback for missing glyphs.
+        fonts.families.entry(family).or_default().insert(0, name.into());
+    }
+    ctx.set_fonts(fonts);
+
     ctx.style_mut_of(egui::Theme::Dark, |style| {
-        style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(180);
-        style.visuals.weak_text_alpha = 0.7;
+        let v = &mut style.visuals;
+        v.panel_fill = Color32::from_rgb(0x1D, 0x23, 0x29);
+        v.window_fill = Color32::from_rgb(0x1D, 0x23, 0x29);
+        v.extreme_bg_color = Color32::from_rgb(0x15, 0x19, 0x1D);
+        v.faint_bg_color = Color32::from_rgb(0x22, 0x29, 0x30);
+        v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0x2E, 0x38, 0x41);
+        v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(0xC4, 0xCD, 0xD5);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(0x2A, 0x33, 0x3B);
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x2A, 0x33, 0x3B);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(0x36, 0x42, 0x4C);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x36, 0x42, 0x4C);
+        v.selection.bg_fill = Color32::from_rgb(0x2F, 0x8F, 0x7B);
+        v.selection.stroke.color = Color32::from_rgb(0x4F, 0xC3, 0xA8);
+        v.weak_text_alpha = 0.72;
     });
     ctx.style_mut_of(egui::Theme::Light, |style| {
-        style.visuals.widgets.noninteractive.fg_stroke.color = Color32::from_gray(60);
-        style.visuals.weak_text_alpha = 0.8;
+        let v = &mut style.visuals;
+        v.panel_fill = Color32::from_rgb(0xE4, 0xE8, 0xEB);
+        v.window_fill = Color32::from_rgb(0xEE, 0xF1, 0xF3);
+        v.extreme_bg_color = Color32::from_rgb(0xF6, 0xF8, 0xF9);
+        v.faint_bg_color = Color32::from_rgb(0xDC, 0xE1, 0xE5);
+        v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0xC3, 0xCB, 0xD2);
+        v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(0x2B, 0x33, 0x3A);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(0xD2, 0xD9, 0xDE);
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xD2, 0xD9, 0xDE);
+        v.selection.bg_fill = Color32::from_rgb(0x1F, 0x7A, 0x68);
+        v.selection.stroke.color = Color32::from_rgb(0x15, 0x5E, 0x4F);
+        v.weak_text_alpha = 0.82;
     });
 }
 
@@ -86,6 +119,8 @@ struct DeoxApp {
     /// The folder the running scan was started on; the input field may change meanwhile.
     scan_root: String,
     drives: Vec<String>,
+    /// Drive root, total and free bytes of the local fixed drives, read once at start.
+    drive_space: Vec<(String, u64, u64)>,
     status: String,
     files_seen: u64,
     /// Items settled and total while a move or check is running.
@@ -107,6 +142,8 @@ struct DeoxApp {
     /// The folder the scan reported most recently.
     scan_folder: String,
     results: Option<Results>,
+    /// Time of the last finished scan, for the bar that fills in under the headline.
+    reveal_start: f64,
     rows: Vec<Row>,
     collapsed: HashSet<Category>,
     selected: HashSet<usize>,
@@ -120,6 +157,24 @@ struct DeoxApp {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetLogicalDrives() -> u32;
+    fn GetDriveTypeW(root: *const u16) -> u32;
+    fn GetDiskFreeSpaceExW(dir: *const u16, available: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+}
+
+const DRIVE_FIXED: u32 = 3;
+
+/// Total and free bytes of a local fixed drive. Removable, network and optical drives are skipped
+/// because asking them can block while a disc spins up or a share times out.
+fn drive_space(root: &str) -> Option<(u64, u64)> {
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is a NUL-terminated string and the out pointers refer to live locals.
+    unsafe {
+        if GetDriveTypeW(wide.as_ptr()) != DRIVE_FIXED || GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) == 0 {
+            return None;
+        }
+    }
+    Some((total, free))
 }
 
 /// Mounted drive roots from the system's drive bitmask; unlike probing each letter, this
@@ -134,7 +189,9 @@ impl DeoxApp {
     fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
         let drives = logical_drives();
+        let drive_space = drives.iter().filter_map(|d| drive_space(d).map(|(total, free)| (d.clone(), total, free))).collect();
         DeoxApp {
+            drive_space,
             ctx,
             tx,
             rx,
@@ -156,6 +213,7 @@ impl DeoxApp {
             scroll_state: (0.0, 0.0),
             scan_folder: String::new(),
             results: None,
+            reveal_start: 0.0,
             rows: Vec::new(),
             collapsed: HashSet::new(),
             selected: HashSet::new(),
@@ -216,6 +274,7 @@ impl DeoxApp {
             findings.iter().enumerate().filter(|(_, f)| f.confidence == Confidence::Safe).map(|(i, _)| i).collect();
         self.results = Some(Results { report: Report::new(findings), files, unreadable, tree });
         self.map_folder = FolderTree::ROOT;
+        self.reveal_start = self.ctx.input(|i| i.time);
         self.rebuild_rows();
     }
 
@@ -354,22 +413,25 @@ impl DeoxApp {
                 self.selected.clear();
             }
             ui.separator();
-            ui.label(format!(
-                "{} of {} selected · {} of {}",
-                self.selected.len(),
-                removable_count,
-                human(selected_size),
-                human(removable_size),
-            ));
+            ui.label(RichText::new(human(selected_size)).strong().size(16.0));
+            ui.label(RichText::new(format!("selected: {} of {}, out of {}", self.selected.len(), removable_count, human(removable_size))).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let none_selected = self.selected.is_empty();
-                let button = ui.add_enabled(idle && !none_selected, egui::Button::new("Move to Recycle Bin…"));
+                let label = if self.dry_run { "Check items…" } else { "Move to Recycle Bin…" };
+                let button = ui.add_enabled(idle && !none_selected, egui::Button::new(label));
                 if none_selected {
                     button.clone().on_disabled_hover_text("Select at least one item first.");
                 }
                 if button.clicked() {
                     self.confirm_delete = true;
                 }
+                // Items are added right to left, so Move comes first to sit on the right.
+                ui.add_enabled_ui(idle, |ui| {
+                    ui.selectable_value(&mut self.dry_run, false, "Move for real")
+                        .on_hover_text("Items go to the Recycle Bin, where you can restore them.");
+                    ui.selectable_value(&mut self.dry_run, true, "Preview only")
+                        .on_hover_text("Runs every check and reports what would happen. Nothing is moved.");
+                });
             });
         });
         ui.add_space(6.0);
@@ -394,7 +456,8 @@ impl DeoxApp {
                     let (done, total) = self.move_progress;
                     if total > 0 {
                         ui.add_space(8.0);
-                        ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0).text(format!("{done} of {total}")));
+                        ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0));
+                        ui.label(format!("{done} of {total}"));
                         ui.add_space(8.0);
                         ui.label(RichText::new("Many small files take a few minutes. Please keep Deox open.").weak());
                         ui.add_space(8.0);
@@ -408,25 +471,86 @@ impl DeoxApp {
             return;
         }
         let Some(results) = &self.results else {
-            ui.add_space(20.0);
-            ui.heading("Find what is taking space");
-            ui.label("Pick a folder or a drive above, then press Scan. Your user folder is a good place to start.");
+            let mut places: Vec<(String, String, String, Option<(u64, u64)>)> = Vec::new();
             if let Some(home) = std::env::var_os("USERPROFILE").filter(|h| PathBuf::from(h).is_dir()) {
-                ui.add_space(8.0);
-                if ui.button("Scan my user folder").clicked() {
-                    self.root = PathBuf::from(home).display().to_string();
-                    self.start_scan();
-                    return;
-                }
+                let home = PathBuf::from(home).display().to_string();
+                places.push(("Your user folder".into(), "A good place to start".into(), home, None));
             }
-            ui.add_space(16.0);
-            ui.label(RichText::new("Each suggestion carries a safety level").strong());
-            legend(ui);
-            ui.add_space(16.0);
-            ui.label("Deox only suggests. Nothing is removed without your confirmation, and removed items go to the Recycle Bin.");
-            if !self.status.is_empty() {
-                ui.add_space(8.0);
-                ui.label(&self.status);
+            for (root, total, free) in &self.drive_space {
+                places.push((root.trim_end_matches('\\').into(), "Whole drive".into(), root.clone(), Some((total.saturating_sub(*free), *total))));
+            }
+            let mut chosen = None;
+            let top = ((ui.available_height() - 400.0) / 2.0).max(24.0);
+            ui.add_space(top);
+            ui.horizontal(|ui| {
+                let available = ui.available_width();
+                let column = START_COLUMN.min(available);
+                ui.add_space(((available - column) / 2.0).max(0.0));
+                ui.vertical(|ui| {
+                    ui.set_width(column);
+                    ui.label(RichText::new("Find what is taking space").size(32.0));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Choose where to look. Nothing is removed without your confirmation.").weak());
+                    ui.add_space(24.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+                    let card_width = ((column - 16.0) / 2.0).floor();
+                    ui.horizontal_wrapped(|ui| {
+                        for (title, caption, root, space) in &places {
+                            let frame = egui::Frame::group(ui.style()).inner_margin(14.0).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
+                                ui.set_width(card_width - 30.0);
+                                ui.set_min_height(86.0);
+                                ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                ui.label(RichText::new(title).size(22.0));
+                                ui.label(RichText::new(caption).weak());
+                                if let Some((used, total)) = space {
+                                    ui.add_space(6.0);
+                                    let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+                                    let colors = &ui.visuals().widgets;
+                                    ui.painter().rect_filled(bar, 2.0, colors.noninteractive.bg_stroke.color);
+                                    let width = bar.width() * *used as f32 / (*total).max(1) as f32;
+                                    let fill = egui::Rect::from_min_size(bar.min, egui::vec2(width, bar.height()));
+                                    ui.painter().rect_filled(fill, 2.0, colors.noninteractive.fg_stroke.color.gamma_multiply(0.6));
+                                    ui.label(RichText::new(format!("{} used of {}", human(*used), human(*total))).weak());
+                                }
+                                });
+                            });
+                            let rect = frame.response.rect;
+                            let click = ui.interact(rect, ui.scope_id().with(("place", root)), egui::Sense::click());
+                            click.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Scan {title}")));
+                            if click.hovered() {
+                                let stroke = egui::Stroke::new(1.5, ui.visuals().selection.stroke.color);
+                                ui.painter().rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
+                            }
+                            if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                chosen = Some(root.clone());
+                            }
+                        }
+                    });
+                    ui.add_space(20.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let dark = ui.visuals().dark_mode;
+                        for (level, text) in [
+                            (Confidence::Safe, "regenerates itself"),
+                            (Confidence::Review, "check it first"),
+                            (Confidence::Info, "uninstall only"),
+                        ] {
+                            let (name, color, _) = confidence_tag(level, dark);
+                            level_glyph(ui, level, color);
+                            ui.label(name);
+                            ui.label(RichText::new(text).weak());
+                            ui.add_space(8.0);
+                        }
+                    });
+                    if !self.status.is_empty() {
+                        ui.add_space(12.0);
+                        ui.label(&self.status);
+                    }
+                });
+            });
+            if let Some(root) = chosen {
+                self.root = root;
+                self.start_scan();
             }
             return;
         };
@@ -460,41 +584,48 @@ impl DeoxApp {
                     );
                 });
             });
+            if let Some(tree) = &results.tree {
+                let by = |level| results.report.findings.iter().filter(|f| f.confidence == level).map(|f| f.size).sum::<u64>();
+                let elapsed = ui.input(|i| i.time) - self.reveal_start;
+                let progress = (elapsed / REVEAL_SECS).clamp(0.0, 1.0) as f32;
+                if progress < 1.0 {
+                    ui.ctx().request_repaint();
+                }
+                let eased = 1.0 - (1.0 - progress).powi(3);
+                reclaim_strip(ui, by(Confidence::Safe), by(Confidence::Review), tree.node(FolderTree::ROOT).size, eased);
+            }
             egui::CollapsingHeader::new("What do Safe, Review and Info mean?").show(ui, legend);
         }
         ui.separator();
 
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.view, View::List, "List");
-            let map_ready = results.tree.is_some();
-            ui.add_enabled_ui(map_ready, |ui| {
-                ui.selectable_value(&mut self.view, View::Map, "Map");
-            })
-            .response
-            .on_disabled_hover_text("The map is out of date after a move. Scan again to refresh it.");
-        });
-        if let (View::Map, Some(tree)) = (self.view, &results.tree) {
-            let dark = ui.visuals().dark_mode;
-            if let Some(action) = map_view(ui, tree, &mut self.map_folder, dark, &results.report, &self.selected) {
-                match action {
-                    MapAction::ShowInList(path) => {
-                        self.filter = path;
-                        self.view = View::List;
-                        self.rebuild_rows();
-                    }
-                    MapAction::SelectSafe(path) => {
-                        for (i, f) in results.report.findings.iter().enumerate() {
-                            if f.confidence == Confidence::Safe && f.path.starts_with(&path) {
-                                self.selected.insert(i);
-                            }
-                        }
-                    }
-                    MapAction::ClearHere(path) => {
-                        self.selected.retain(|i| !results.report.findings.get(*i).is_some_and(|f| f.path.starts_with(&path)));
-                    }
-                }
+        // Wide windows show the map beside the list; narrow ones switch between them.
+        let split = results.tree.is_some() && ui.available_width() >= SPLIT_MIN_WIDTH;
+        let mut map_action = None;
+        if split {
+            if let Some(tree) = &results.tree {
+                let dark = ui.visuals().dark_mode;
+                let width = ui.available_width() * 0.55;
+                egui::Panel::left("map_panel").resizable(true).default_size(width).size_range(320.0..=width * 1.4).show(ui, |ui| {
+                    map_action = map_view(ui, tree, &mut self.map_folder, dark, &results.report, &self.selected);
+                });
             }
-            return;
+        } else {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view, View::List, "List");
+                let map_ready = results.tree.is_some();
+                ui.add_enabled_ui(map_ready, |ui| {
+                    ui.selectable_value(&mut self.view, View::Map, "Map");
+                })
+                .response
+                .on_disabled_hover_text("The map is out of date after a move. Scan again to refresh it.");
+            });
+            if let (View::Map, Some(tree)) = (self.view, &results.tree) {
+                let dark = ui.visuals().dark_mode;
+                if let Some(action) = map_view(ui, tree, &mut self.map_folder, dark, &results.report, &self.selected) {
+                    self.apply_map_action(action);
+                }
+                return;
+            }
         }
 
         let mut filter_changed = false;
@@ -606,12 +737,13 @@ impl DeoxApp {
                                 ui.add_space(CHECK_W);
                             }
                             let open = !self.collapsed.contains(category);
-                            let text = format!("{}  ·  {}  ·  {}", category_name(*category), items(*count), human(*total));
                             let icon = disclosure_icon(ui, open);
-                            let label = ui.add(egui::Button::new(RichText::new(text).strong()).frame(false));
+                            let label = ui.add(egui::Button::new(RichText::new(category_name(*category)).size(16.0)).frame(false));
                             if icon.clicked() || label.clicked() {
                                 toggled = Some(*category);
                             }
+                            ui.label(RichText::new(items(*count)).weak());
+                            ui.label(RichText::new(human(*total)).monospace());
                             if selectable > 0 {
                                 share_bar(ui, *total, removable_size.max(1));
                             }
@@ -644,7 +776,8 @@ impl DeoxApp {
                             });
                             let (tag, color, meaning) = confidence_tag(finding.confidence, dark);
                             cell(ui, TAG_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(tag).color(color).strong()).on_hover_text(meaning);
+                                level_glyph(ui, finding.confidence, color);
+                                ui.label(RichText::new(tag).strong()).on_hover_text(meaning);
                             });
                             cell(ui, SIZE_W, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(RichText::new(human(finding.size)).monospace());
@@ -712,6 +845,9 @@ impl DeoxApp {
                 self.selected.insert(i);
             }
         }
+        if let Some(action) = map_action {
+            self.apply_map_action(action);
+        }
         if filter_changed {
             self.rebuild_rows();
         }
@@ -723,6 +859,28 @@ impl DeoxApp {
         }
         if uninstall.is_some() {
             self.pending_uninstall = uninstall;
+        }
+    }
+
+    fn apply_map_action(&mut self, action: MapAction) {
+        match action {
+            MapAction::ShowInList(path) => {
+                self.filter = path;
+                self.view = View::List;
+                self.rebuild_rows();
+            }
+            MapAction::SelectSafe(path) => {
+                let Some(results) = &self.results else { return };
+                for (i, f) in results.report.findings.iter().enumerate() {
+                    if f.confidence == Confidence::Safe && f.path.starts_with(&path) {
+                        self.selected.insert(i);
+                    }
+                }
+            }
+            MapAction::ClearHere(path) => {
+                let Some(results) = &self.results else { return };
+                self.selected.retain(|i| !results.report.findings.get(*i).is_some_and(|f| f.path.starts_with(&path)));
+            }
         }
     }
 
@@ -774,7 +932,9 @@ impl DeoxApp {
                     });
                 });
                 ui.add_space(6.0);
-                ui.checkbox(&mut self.dry_run, "Check only. Move nothing yet.");
+                ui.label(
+                    RichText::new(if self.dry_run { "Preview only is on: nothing will be moved." } else { "Move for real is on." }).weak(),
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let label = if self.dry_run { "Check items".to_string() } else { format!("Move {} to Recycle Bin", items(count)) };
@@ -821,13 +981,21 @@ impl DeoxApp {
                             ui.label(RichText::new("Windows refused some items, usually because a program is using them. Close browsers, chat apps and editors, then scan and try again.").weak());
                         }
                         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                            for e in problems.iter().take(MAX_LISTED_SKIPS) {
-                                let reason = ui.add(egui::Label::new(RichText::new(describe(&e.outcome)).strong()));
-                                if let Outcome::Failed(why) = &e.outcome {
-                                    reason.on_hover_text(why);
+                            let mut shown: Vec<_> = problems.iter().take(MAX_LISTED_SKIPS).collect();
+                            shown.sort_by_key(|e| describe(&e.outcome));
+                            let mut current = String::new();
+                            for e in shown {
+                                let reason = describe(&e.outcome);
+                                if reason != current {
+                                    let count = problems.iter().filter(|p| describe(&p.outcome) == reason).count();
+                                    ui.add_space(6.0);
+                                    let heading = ui.add(egui::Label::new(RichText::new(format!("{reason}, {}", items(count))).strong()));
+                                    if let Outcome::Failed(why) = &e.outcome {
+                                        heading.on_hover_text(why);
+                                    }
+                                    current = reason;
                                 }
-                                ui.add(egui::Label::new(RichText::new(e.path.display().to_string()).weak()).wrap());
-                                ui.add_space(4.0);
+                                ui.add(egui::Label::new(RichText::new(e.path.display().to_string()).weak().small()).wrap());
                             }
                             if problems.len() > MAX_LISTED_SKIPS {
                                 ui.label(format!("…and {} more. All of them are in the action log.", items(problems.len() - MAX_LISTED_SKIPS)));
@@ -906,7 +1074,8 @@ impl eframe::App for DeoxApp {
         ui.add_enabled_ui(!modal, |ui| {
             egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
             egui::Panel::bottom("footer").show(ui, |ui| self.footer(ui));
-            egui::CentralPanel::default().show(ui, |ui| self.central(ui));
+            let frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(20, 14));
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| self.central(ui));
         });
         self.dialogs(&ctx);
     }
@@ -945,10 +1114,10 @@ fn confidence_tag(confidence: Confidence, dark: bool) -> (&'static str, Color32,
         Color32::from_rgb(r, g, b)
     };
     match confidence {
-        Confidence::Safe => ("Safe", pick([92, 205, 128], [17, 107, 43]), "Regenerated automatically. Selected by default."),
+        Confidence::Safe => ("Safe", pick([232, 96, 47], [178, 63, 18]), "Regenerated automatically. Selected by default."),
         Confidence::Review => (
             "Review",
-            pick([232, 183, 70], [133, 84, 0]),
+            pick([229, 160, 66], [140, 92, 0]),
             "Probably not needed, but check it first. Never selected by default.",
         ),
         Confidence::Info => (
@@ -971,13 +1140,31 @@ fn describe(outcome: &Outcome) -> String {
         Outcome::NotDeletable => "Can't be removed".into(),
         Outcome::Missing => "Already gone".into(),
         Outcome::Changed => "Changed since the scan".into(),
-        Outcome::Failed(_) => "Windows refused to move it (hover for the technical detail)".into(),
+        Outcome::Failed(_) => "Windows refused to move them (hover for the technical detail)".into(),
     }
 }
 
 /// Count and size of the findings Deox can actually move; installed programs are only reported.
 fn removable(report: &Report) -> (usize, u64) {
     report.findings.iter().filter(|f| f.confidence != Confidence::Info).fold((0, 0), |(n, s), f| (n + 1, s + f.size))
+}
+
+/// Seconds the bar below the headline takes to fill after a scan finishes.
+const REVEAL_SECS: f64 = 0.9;
+
+/// The scanned size as one bar; the Safe and Review parts fill in from the left as `reveal` goes from 0 to 1.
+fn reclaim_strip(ui: &mut egui::Ui, safe: u64, review: u64, total: u64, reveal: f32) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+    let dark = ui.visuals().dark_mode;
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let width = |bytes: u64| if bytes == 0 { 0.0 } else { (rect.width() * bytes as f32 / total.max(1) as f32).max(3.0) * reveal };
+    let safe_w = width(safe).min(rect.width());
+    let review_w = width(review).min(rect.width() - safe_w);
+    let part = |from: f32, to: f32| egui::Rect::from_min_max(egui::pos2(rect.left() + from, rect.top()), egui::pos2(rect.left() + to, rect.bottom()));
+    painter.rect_filled(part(0.0, safe_w), 2.0, confidence_tag(Confidence::Safe, dark).1);
+    painter.rect_filled(part(safe_w, safe_w + review_w), 2.0, confidence_tag(Confidence::Review, dark).1);
+    response.on_hover_text(format!("Of {} scanned: {} Safe, {} Review", human(total), human(safe), human(review)));
 }
 
 /// A thin bar showing a group's share of everything that could be freed.
@@ -987,14 +1174,39 @@ fn share_bar(ui: &mut egui::Ui, part: u64, whole: u64) {
     let painter = ui.painter();
     painter.rect_filled(rect, 3.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
     let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * share, rect.height()));
-    painter.rect_filled(fill, 3.0, ui.visuals().selection.bg_fill);
+    painter.rect_filled(fill, 3.0, confidence_tag(Confidence::Safe, ui.visuals().dark_mode).1);
     response.on_hover_text(format!("{:.0}% of what could be freed", share * 100.0));
 }
 
 /// Rows shown in the list of skipped items; longer lists are summarized.
 const MAX_LISTED_SKIPS: usize = 200;
 const CHECK_W: f32 = 24.0;
-const TAG_W: f32 = 52.0;
+const TAG_W: f32 = 72.0;
+/// Width of the centered column on the start screen.
+const START_COLUMN: f32 = 600.0;
+/// Content width from which the map and the list are shown side by side.
+const SPLIT_MIN_WIDTH: f32 = 860.0;
+
+/// Marks a safety level by shape as well as color: solid for Safe, hatched for Review, outlined for Info.
+fn level_glyph(ui: &mut egui::Ui, level: Confidence, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let painter = ui.painter().with_clip_rect(rect);
+    match level {
+        Confidence::Safe => {
+            painter.rect_filled(rect, 2.0, color);
+        }
+        Confidence::Review => {
+            for k in 0..5 {
+                let x = rect.left() + k as f32 * 4.0 - 4.0;
+                painter.line_segment([egui::pos2(x, rect.bottom()), egui::pos2(x + 12.0, rect.top())], egui::Stroke::new(1.5, color));
+            }
+            painter.rect_stroke(rect.shrink(0.75), 2.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
+        }
+        Confidence::Info => {
+            painter.rect_stroke(rect.shrink(0.75), 2.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
+        }
+    }
+}
 const SIZE_W: f32 = 76.0;
 const ITEM_INDENT: f32 = 18.0;
 
@@ -1070,33 +1282,33 @@ fn map_view(
         }
     }
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(human(node.size)).strong());
-        ui.label(RichText::new(format!("in this folder · {} Safe · {} Review suggested", human(node.safe), human(node.review))).weak());
-        if ui.button("Show these items in the list").clicked() {
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(human(node.size)).size(22.0));
+        ui.label(RichText::new(format!("in this folder, {} Safe and {} Review suggested", human(node.safe), human(node.review))).weak());
+    });
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Show in list").on_hover_text("Lists the suggested items under this folder.").clicked() {
             action = Some(MapAction::ShowInList(folder_path.display().to_string()));
         }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("Select Safe items here").on_hover_text("Selects every Safe item under this folder. Nothing moves until you confirm.").clicked() {
+        if ui.button("Select Safe here").on_hover_text("Selects every Safe item under this folder. Nothing moves until you confirm.").clicked() {
             action = Some(MapAction::SelectSafe(folder_path.clone()));
         }
-        if ui.add_enabled(chosen_here > 0, egui::Button::new("Clear selection here")).clicked() {
+        if ui.add_enabled(chosen_here > 0, egui::Button::new("Clear here")).on_hover_text("Clears the selection under this folder.").clicked() {
             action = Some(MapAction::ClearHere(folder_path.clone()));
         }
-        ui.label(RichText::new(format!("{} selected under this folder", items(chosen_here))).weak());
+        ui.label(RichText::new(format!("{} selected here", items(chosen_here))).weak());
     });
 
     let (_, safe_color, _) = confidence_tag(Confidence::Safe, dark);
     let (_, review_color, _) = confidence_tag(Confidence::Review, dark);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Tile size is its share of this folder.").weak());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("The stripe on a tile shows what Deox suggests inside:").weak());
         for (color, name) in [(safe_color, "Safe"), (review_color, "Review")] {
             let (swatch, _) = ui.allocate_exact_size(egui::vec2(18.0, 8.0), egui::Sense::hover());
             ui.painter().rect_filled(swatch, 2.0, color);
             ui.label(RichText::new(name).weak());
         }
-        ui.label(RichText::new("stripe: what Deox suggests inside.").weak());
     });
 
     // The subfolders holding the most suggested bytes, as shortcuts.
@@ -1238,9 +1450,10 @@ fn legend(ui: &mut egui::Ui) {
         let (tag, color, meaning) = confidence_tag(level, dark);
         ui.horizontal(|ui| {
             cell(ui, TAG_W, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.label(RichText::new(tag).color(color).strong());
+                level_glyph(ui, level, color);
+                ui.label(RichText::new(tag).strong());
             });
-            ui.label(meaning);
+            ui.label(RichText::new(meaning).weak());
         });
     }
 }

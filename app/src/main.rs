@@ -117,10 +117,23 @@ struct DeoxApp {
     error: Option<String>,
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLogicalDrives() -> u32;
+}
+
+/// Mounted drive roots from the system's drive bitmask; unlike probing each letter, this
+/// never touches an empty floppy or a disconnected network drive.
+fn logical_drives() -> Vec<String> {
+    // SAFETY: the call takes no arguments and only returns a bitmask.
+    let mask = unsafe { GetLogicalDrives() };
+    ('A'..='Z').enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, c)| format!("{c}:\\")).collect()
+}
+
 impl DeoxApp {
     fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
-        let drives = ('A'..='Z').map(|c| format!("{c}:\\")).filter(|d| PathBuf::from(d).exists()).collect();
+        let drives = logical_drives();
         DeoxApp {
             ctx,
             tx,

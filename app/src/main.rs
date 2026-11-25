@@ -1,18 +1,32 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod map;
+mod ui;
 mod worker;
 
 use deox_core::delete::{launch_uninstaller, DeleteReport, Outcome};
 use deox_core::report::{Category, Confidence, Finding, Report};
 use deox_core::scan::Cancel;
-use deox_core::treemap::{layout, squarify, Cell, CellKind, FolderTree, LiveTree, Rect};
+use deox_core::treemap::{FolderTree, LiveTree};
 use eframe::egui::{self, Color32, RichText};
-use std::collections::{HashMap, HashSet};
+use map::{LiveMap, MapAction, MapState, Pick};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use ui::{
+    category_name, cell, confidence_tag, configure_theme, dialog_width, disclosure_icon, human, items, legend_line, level_glyph,
+    name_checkbox, paths, reclaim_strip, scan_step, share_bar, step_ticks, sweep, CHECK_W, ITEM_INDENT, REVEAL_SECS, SIZE_W, TAG_W,
+};
 use worker::{Msg, Notifier};
+
+/// Rows shown in the list of skipped items; longer lists are summarized.
+const MAX_LISTED_SKIPS: usize = 200;
+/// Width of the centered column on the start screen.
+const START_COLUMN: f32 = 600.0;
+/// Content width from which the map and the list are shown side by side.
+const SPLIT_MIN_WIDTH: f32 = 860.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -30,57 +44,6 @@ fn main() -> eframe::Result {
             Ok(Box::new(DeoxApp::new(cc.egui_ctx.clone())))
         }),
     )
-}
-
-/// Darkens or lightens the default text so that even the dim text used for reasons and paths
-/// keeps at least 4.5:1 against the panel in both themes (egui's own defaults give about 2.7:1).
-fn configure_theme(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    for (name, bytes, family) in [
-        ("Lato-Light", &include_bytes!("../assets/fonts/Lato-Light.ttf")[..], egui::FontFamily::Proportional),
-        ("JetBrainsMono", &include_bytes!("../assets/fonts/JetBrainsMono.ttf")[..], egui::FontFamily::Monospace),
-    ] {
-        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(bytes)));
-        // Placed first, so the bundled font is used and egui's own remain as fallback for missing glyphs.
-        fonts.families.entry(family).or_default().insert(0, name.into());
-    }
-    ctx.set_fonts(fonts);
-
-    ctx.style_mut_of(egui::Theme::Dark, |style| {
-        let v = &mut style.visuals;
-        v.panel_fill = Color32::from_rgb(0x1D, 0x23, 0x29);
-        v.window_fill = Color32::from_rgb(0x1D, 0x23, 0x29);
-        v.extreme_bg_color = Color32::from_rgb(0x15, 0x19, 0x1D);
-        v.faint_bg_color = Color32::from_rgb(0x22, 0x29, 0x30);
-        v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0x2E, 0x38, 0x41);
-        v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(0xC4, 0xCD, 0xD5);
-        v.widgets.inactive.bg_fill = Color32::from_rgb(0x2A, 0x33, 0x3B);
-        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x2A, 0x33, 0x3B);
-        v.widgets.hovered.bg_fill = Color32::from_rgb(0x36, 0x42, 0x4C);
-        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x36, 0x42, 0x4C);
-        v.selection.bg_fill = Color32::from_rgb(0x2F, 0x8F, 0x7B);
-        v.selection.stroke.color = Color32::from_rgb(0x4F, 0xC3, 0xA8);
-        v.weak_text_alpha = 0.72;
-    });
-    ctx.style_mut_of(egui::Theme::Light, |style| {
-        let v = &mut style.visuals;
-        v.panel_fill = Color32::from_rgb(0xE4, 0xE8, 0xEB);
-        v.window_fill = Color32::from_rgb(0xEE, 0xF1, 0xF3);
-        v.extreme_bg_color = Color32::from_rgb(0xF6, 0xF8, 0xF9);
-        v.faint_bg_color = Color32::from_rgb(0xDC, 0xE1, 0xE5);
-        v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0xC3, 0xCB, 0xD2);
-        v.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(0x2B, 0x33, 0x3A);
-        v.widgets.inactive.bg_fill = Color32::from_rgb(0xD2, 0xD9, 0xDE);
-        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xD2, 0xD9, 0xDE);
-        v.selection.bg_fill = Color32::from_rgb(0x1F, 0x7A, 0x68);
-        v.selection.stroke.color = Color32::from_rgb(0x15, 0x5E, 0x4F);
-        v.weak_text_alpha = 0.82;
-    });
-}
-
-/// Keeps a dialog inside a narrow window.
-fn dialog_width(ctx: &egui::Context, wanted: f32) -> f32 {
-    wanted.min(ctx.content_rect().width() - 48.0).max(320.0)
 }
 
 #[derive(PartialEq)]
@@ -327,105 +290,7 @@ impl DeoxApp {
     /// jump: known rows keep their place unless one is overtaken by more than 5%, at most once a second.
     /// A folder seen for the first time takes its place at once.
     fn merge_live_folders(&mut self, folders: Vec<(String, u64)>) {
-        stable_order(&mut self.live_folders, folders, &mut self.live_reordered);
-    }
-
-    /// Rebuilds what the live map shows, at most twice a second, so tiles do not flicker while sizes grow.
-    fn refresh_live_map(&mut self) {
-        let Some(live) = self.live_tree.clone() else { return };
-        if self.live_map.refreshed.is_some_and(|t| t.elapsed() < LIVE_MAP_REFRESH) {
-            return;
-        }
-        let live = live.lock().unwrap_or_else(|e| e.into_inner());
-        let tree = live.tree();
-        let map = &mut self.live_map;
-        stable_order(&mut map.order, tree.children_by_size(map.folder), &mut map.reordered);
-        let tiles = map_tiles(tree, map.folder, &map.order)
-            .into_iter()
-            .map(|(target, name, size)| LiveTile {
-                path: target.map_or_else(|| name.clone(), |c| tree.path(c).display().to_string()),
-                opens: target.is_some_and(|c| !tree.node(c).children.is_empty()),
-                target,
-                name,
-                size,
-            })
-            .collect();
-        let trail = tree.trail(map.folder);
-        let trail = trail
-            .iter()
-            .enumerate()
-            .map(|(n, id)| (*id, if n == 0 { tree.path(*id).display().to_string() } else { tree.node(*id).name.clone() }))
-            .collect();
-        map.snapshot = Some(LiveSnapshot { trail, size: tree.node(map.folder).size, tiles });
-        map.refreshed = Some(Instant::now());
-    }
-
-    /// The folder tree so far as a treemap. Tiles are plain: nothing has been judged yet, so there is no
-    /// Safe/Review stripe, and a click opens a folder the same way as in the finished map.
-    fn live_map_view(&mut self, ui: &mut egui::Ui) {
-        self.refresh_live_map();
-        ui.ctx().request_repaint_after(LIVE_MAP_REFRESH);
-        let Some(snapshot) = &self.live_map.snapshot else { return };
-        let mut open = None;
-        ui.horizontal_wrapped(|ui| {
-            for (n, (id, name)) in snapshot.trail.iter().enumerate() {
-                if n > 0 {
-                    ui.label("›");
-                }
-                if ui.selectable_label(n + 1 == snapshot.trail.len(), name).clicked() {
-                    open = Some(*id);
-                }
-            }
-        });
-        ui.label(RichText::new(format!("{} so far. Sizes are still growing.", human(snapshot.size))).weak());
-        ui.add_space(4.0);
-        if snapshot.tiles.is_empty() {
-            ui.label("Nothing measured in this folder yet.");
-        }
-
-        let available = ui.available_size();
-        let (area, _) = ui.allocate_exact_size(egui::vec2(available.x, available.y.max(160.0)), egui::Sense::hover());
-        let sizes: Vec<u64> = snapshot.tiles.iter().map(|t| t.size).collect();
-        let rects = squarify(&sizes, Rect { x: area.min.x, y: area.min.y, w: area.width(), h: area.height() });
-        let font = egui::TextStyle::Body.resolve(ui.style());
-        let line = ui.text_style_height(&egui::TextStyle::Body) + 2.0;
-        for (index, (t, r)) in snapshot.tiles.iter().zip(&rects).enumerate() {
-            let tile = egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h)).shrink(1.0);
-            if tile.width() < 2.0 || tile.height() < 2.0 {
-                continue;
-            }
-            let opens = t.target.is_some() && t.opens;
-            let sense = if opens { egui::Sense::click() } else { egui::Sense::hover() };
-            let response = ui.interact(tile, ui.auto_id_with(("live_tile", index)), sense);
-            let widgets = &ui.visuals().widgets;
-            let (fill, text_color) = if response.hovered() {
-                (widgets.hovered.bg_fill, widgets.hovered.fg_stroke.color)
-            } else {
-                (widgets.inactive.bg_fill, widgets.inactive.fg_stroke.color)
-            };
-            let painter = ui.painter().with_clip_rect(tile);
-            painter.rect_filled(tile, 2.0, fill);
-            if tile.width() > 56.0 && tile.height() > 24.0 {
-                painter.text(tile.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, &t.name, font.clone(), text_color);
-                if tile.height() > 24.0 + line {
-                    painter.text(tile.left_top() + egui::vec2(6.0, 4.0 + line), egui::Align2::LEFT_TOP, human(t.size), font.clone(), text_color.gamma_multiply(0.8));
-                }
-            }
-            if opens {
-                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{}, {}", t.name, human(t.size))));
-            }
-            let clicked = response.clicked();
-            let hint = if opens { "\nClick to open." } else { "" };
-            let response = if opens { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };
-            response.on_hover_text(format!("{}\n{}{hint}", t.path, human(t.size)));
-            if clicked {
-                open = t.target;
-            }
-        }
-        if let Some(folder) = open {
-            self.live_map = LiveMap { folder, ..LiveMap::default() };
-            ui.ctx().request_repaint();
-        }
+        map::stable_order(&mut self.live_folders, folders, &mut self.live_reordered);
     }
 
     fn live_folder_list(&self, ui: &mut egui::Ui) {
@@ -600,69 +465,73 @@ impl DeoxApp {
             ui.selectable_value(&mut self.scan_view, View::Map, "Map");
         });
         if self.scan_view == View::Map {
-            self.live_map_view(ui);
+            map::live_map_view(ui, self.live_tree.as_ref(), &mut self.live_map);
         } else {
             self.live_folder_list(ui);
         }
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
-        if self.phase == Phase::Scanning {
-            self.scan_screen(ui);
-            return;
+        match self.phase {
+            Phase::Scanning => self.scan_screen(ui),
+            Phase::Deleting => self.deleting_screen(ui),
+            Phase::Idle if self.results.is_none() => self.start_screen(ui),
+            Phase::Idle => self.results_screen(ui),
         }
-        if self.phase != Phase::Idle {
-            ui.vertical_centered(|ui| {
-                ui.add_space(120.0);
-                ui.spinner();
+    }
+
+    fn deleting_screen(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(120.0);
+            ui.spinner();
+            ui.add_space(8.0);
+            ui.label(&self.status);
+            let (done, total) = self.move_progress;
+            if total > 0 {
                 ui.add_space(8.0);
-                ui.label(&self.status);
-                let (done, total) = self.move_progress;
-                if total > 0 {
-                    ui.add_space(8.0);
-                    ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0));
-                    ui.label(format!("{done} of {total}"));
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Many small files take a few minutes. Please keep Deox open.").weak());
-                    ui.add_space(8.0);
-                    if ui.button("Stop after this batch").clicked() {
-                        self.move_cancel.cancel();
-                        self.status = "Stopping…".into();
-                    }
+                ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0));
+                ui.label(format!("{done} of {total}"));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Many small files take a few minutes. Please keep Deox open.").weak());
+                ui.add_space(8.0);
+                if ui.button("Stop after this batch").clicked() {
+                    self.move_cancel.cancel();
+                    self.status = "Stopping…".into();
                 }
-            });
-            return;
+            }
+        });
+    }
+
+    fn start_screen(&mut self, ui: &mut egui::Ui) {
+        let mut places: Vec<(String, String, String, Option<(u64, u64)>)> = Vec::new();
+        if let Some(home) = std::env::var_os("USERPROFILE").filter(|h| PathBuf::from(h).is_dir()) {
+            let home = PathBuf::from(home).display().to_string();
+            places.push(("Your user folder".into(), "A good place to start".into(), home, None));
         }
-        let Some(results) = &self.results else {
-            let mut places: Vec<(String, String, String, Option<(u64, u64)>)> = Vec::new();
-            if let Some(home) = std::env::var_os("USERPROFILE").filter(|h| PathBuf::from(h).is_dir()) {
-                let home = PathBuf::from(home).display().to_string();
-                places.push(("Your user folder".into(), "A good place to start".into(), home, None));
-            }
-            for (root, total, free) in &self.drive_space {
-                places.push((root.trim_end_matches('\\').into(), "Whole drive".into(), root.clone(), Some((total.saturating_sub(*free), *total))));
-            }
-            let mut chosen = None;
-            let top = ((ui.available_height() - 400.0) / 2.0).max(24.0);
-            ui.add_space(top);
-            ui.horizontal(|ui| {
-                let available = ui.available_width();
-                let column = START_COLUMN.min(available);
-                ui.add_space(((available - column) / 2.0).max(0.0));
-                ui.vertical(|ui| {
-                    ui.set_width(column);
-                    ui.label(RichText::new("Find what is taking space").size(32.0));
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Choose where to look. Nothing is removed without your confirmation.").weak());
-                    ui.add_space(24.0);
-                    ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
-                    let card_width = ((column - 16.0) / 2.0).floor();
-                    ui.horizontal_wrapped(|ui| {
-                        for (title, caption, root, space) in &places {
-                            let frame = egui::Frame::group(ui.style()).inner_margin(14.0).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
-                                ui.set_width(card_width - 30.0);
-                                ui.set_min_height(86.0);
-                                ui.vertical(|ui| {
+        for (root, total, free) in &self.drive_space {
+            places.push((root.trim_end_matches('\\').into(), "Whole drive".into(), root.clone(), Some((total.saturating_sub(*free), *total))));
+        }
+        let mut chosen = None;
+        let top = ((ui.available_height() - 400.0) / 2.0).max(24.0);
+        ui.add_space(top);
+        ui.horizontal(|ui| {
+            let available = ui.available_width();
+            let column = START_COLUMN.min(available);
+            ui.add_space(((available - column) / 2.0).max(0.0));
+            ui.vertical(|ui| {
+                ui.set_width(column);
+                ui.label(RichText::new("Find what is taking space").size(32.0));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Choose where to look. Nothing is removed without your confirmation.").weak());
+                ui.add_space(24.0);
+                ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+                let card_width = ((column - 16.0) / 2.0).floor();
+                ui.horizontal_wrapped(|ui| {
+                    for (title, caption, root, space) in &places {
+                        let frame = egui::Frame::group(ui.style()).inner_margin(14.0).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
+                            ui.set_width(card_width - 30.0);
+                            ui.set_min_height(86.0);
+                            ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 4.0;
                                 ui.label(RichText::new(title).size(22.0));
                                 ui.label(RichText::new(caption).weak());
@@ -679,35 +548,36 @@ impl DeoxApp {
                                     ui.add_space(6.0);
                                     ui.add(egui::Label::new(RichText::new(root).monospace().small().weak()).truncate());
                                 }
-                                });
                             });
-                            let rect = frame.response.rect;
-                            let click = ui.interact(rect, ui.scope_id().with(("place", root)), egui::Sense::click());
-                            click.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Scan {title}")));
-                            if click.hovered() {
-                                let stroke = egui::Stroke::new(1.5, ui.visuals().selection.stroke.color);
-                                ui.painter().rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
-                            }
-                            if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                chosen = Some(root.clone());
-                            }
+                        });
+                        let rect = frame.response.rect;
+                        let click = ui.interact(rect, ui.scope_id().with(("place", root)), egui::Sense::click());
+                        click.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Scan {title}")));
+                        if click.hovered() {
+                            let stroke = egui::Stroke::new(1.5, ui.visuals().selection.stroke.color);
+                            ui.painter().rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
                         }
-                    });
-                    ui.add_space(20.0);
-                    legend_line(ui);
-                    if !self.status.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(&self.status);
+                        if click.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            chosen = Some(root.clone());
+                        }
                     }
                 });
+                ui.add_space(20.0);
+                legend_line(ui);
+                if !self.status.is_empty() {
+                    ui.add_space(12.0);
+                    ui.label(&self.status);
+                }
             });
-            if let Some(root) = chosen {
-                self.root = root;
-                self.start_scan();
-            }
-            return;
-        };
+        });
+        if let Some(root) = chosen {
+            self.root = root;
+            self.start_scan();
+        }
+    }
 
+    fn results_screen(&mut self, ui: &mut egui::Ui) {
+        let Some(results) = &self.results else { return };
         let (removable_count, removable_size) = removable(&results.report);
         if removable_count == 0 {
             ui.label(format!("Scanned {} files. System folders such as Windows and Program Files are skipped.", results.files));
@@ -783,7 +653,7 @@ impl DeoxApp {
                 let dark = ui.visuals().dark_mode;
                 let width = ui.available_width() * 0.55;
                 egui::Panel::left("map_panel").resizable(true).default_size(width).size_range(320.0..=width * 1.4).show(ui, |ui| {
-                    map_action = map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected);
+                    map_action = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected);
                 });
             }
         } else {
@@ -802,11 +672,19 @@ impl DeoxApp {
 
         if let (View::Map, Some(tree)) = (self.tab, &results.tree) {
             let dark = ui.visuals().dark_mode;
-            if let Some(action) = map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected) {
+            if let Some(action) = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected) {
                 self.apply_map_action(action);
             }
             return;
         }
+        self.results_list(ui, removable_size);
+        if let Some(action) = map_action {
+            self.apply_map_action(action);
+        }
+    }
+
+    fn results_list(&mut self, ui: &mut egui::Ui, removable_size: u64) {
+        let Some(results) = &self.results else { return };
         ui.add_space(4.0);
 
         let mut filter_changed = false;
@@ -1033,7 +911,7 @@ impl DeoxApp {
                 _ => {}
             }
         }
-        if let (Some((category, on)), Some(results)) = (category_select, &self.results) {
+        if let Some((category, on)) = category_select {
             for (i, _) in results.report.findings.iter().enumerate().filter(|(i, f)| f.category == category && f.confidence != Confidence::Info && self.visible[*i]) {
                 if on {
                     self.selected.insert(i);
@@ -1046,9 +924,6 @@ impl DeoxApp {
             for (i, _) in results.report.findings.iter().enumerate().filter(|(i, f)| f.confidence != Confidence::Info && self.visible[*i]) {
                 self.selected.insert(i);
             }
-        }
-        if let Some(action) = map_action {
-            self.apply_map_action(action);
         }
         if clicked_row.is_some() {
             self.cursor_row = clicked_row;
@@ -1308,59 +1183,6 @@ impl eframe::App for DeoxApp {
     }
 }
 
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-fn category_name(category: Category) -> &'static str {
-    match category {
-        Category::Temp => "Temporary files",
-        Category::AppCache => "Application caches",
-        Category::DevArtifact => "Developer artifacts",
-        Category::Duplicate => "Duplicate files",
-        Category::OldLarge => "Old large files",
-        Category::OrphanedAppData => "Orphaned app data",
-        Category::Bloatware => "Installed programs worth a look",
-    }
-}
-
-/// Label, color and meaning of a safety level. Colors keep at least 4.5:1 against the panel in both themes.
-fn confidence_tag(confidence: Confidence, dark: bool) -> (&'static str, Color32, &'static str) {
-    let pick = |dark_rgb: [u8; 3], light_rgb: [u8; 3]| {
-        let [r, g, b] = if dark { dark_rgb } else { light_rgb };
-        Color32::from_rgb(r, g, b)
-    };
-    match confidence {
-        Confidence::Safe => ("Safe", pick([232, 96, 47], [178, 63, 18]), "Regenerated automatically. Selected by default."),
-        Confidence::Review => (
-            "Review",
-            pick([229, 160, 66], [140, 92, 0]),
-            "Probably not needed, but check it first. Never selected by default.",
-        ),
-        Confidence::Info => (
-            "Info",
-            pick([158, 166, 178], [84, 91, 103]),
-            "An installed program. Deox only reports it; removal goes through the program's own uninstaller.",
-        ),
-    }
-}
-
-/// Gives a checkbox without visible text a name for screen readers.
-fn name_checkbox(check: &egui::Response, on: bool, name: &str) {
-    check.widget_info(|| egui::WidgetInfo::selected(egui::accesskit::Role::CheckBox, true, on, name));
-}
-
 fn describe(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Deleted | Outcome::WouldDelete => "ok".into(),
@@ -1377,630 +1199,11 @@ fn removable(report: &Report) -> (usize, u64) {
     report.findings.iter().filter(|f| f.confidence != Confidence::Info).fold((0, 0), |(n, s), f| (n + 1, s + f.size))
 }
 
-/// Seconds the bar below the headline takes to fill after a scan finishes.
-const REVEAL_SECS: f64 = 0.9;
-
-/// The scanned size as one bar; the Safe and Review parts fill in from the left as `reveal` goes from 0 to 1.
-fn reclaim_strip(ui: &mut egui::Ui, safe: u64, review: u64, total: u64, reveal: f32) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
-    let dark = ui.visuals().dark_mode;
-    let painter = ui.painter();
-    painter.rect_filled(rect, 2.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
-    let width = |bytes: u64| if bytes == 0 { 0.0 } else { (rect.width() * bytes as f32 / total.max(1) as f32).max(3.0) * reveal };
-    let safe_w = width(safe).min(rect.width());
-    let review_w = width(review).min(rect.width() - safe_w);
-    let part = |from: f32, to: f32| egui::Rect::from_min_max(egui::pos2(rect.left() + from, rect.top()), egui::pos2(rect.left() + to, rect.bottom()));
-    painter.rect_filled(part(0.0, safe_w), 2.0, confidence_tag(Confidence::Safe, dark).1);
-    painter.rect_filled(part(safe_w, safe_w + review_w), 2.0, confidence_tag(Confidence::Review, dark).1);
-    response.on_hover_text(format!("Of {} scanned: {} Safe, {} Review", human(total), human(safe), human(review)));
-}
-
-/// A thin bar showing a group's share of everything that could be freed.
-fn share_bar(ui: &mut egui::Ui, part: u64, whole: u64) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(120.0, 6.0), egui::Sense::hover());
-    let share = (part as f32 / whole as f32).clamp(0.0, 1.0);
-    let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
-    let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * share, rect.height()));
-    painter.rect_filled(fill, 3.0, confidence_tag(Confidence::Safe, ui.visuals().dark_mode).1);
-    response.on_hover_text(format!("{:.0}% of what could be freed", share * 100.0));
-}
-
-/// Rows shown in the list of skipped items; longer lists are summarized.
-const MAX_LISTED_SKIPS: usize = 200;
-const CHECK_W: f32 = 24.0;
-const TAG_W: f32 = 72.0;
-/// Width of the centered column on the start screen.
-const START_COLUMN: f32 = 600.0;
-/// Content width from which the map and the list are shown side by side.
-const SPLIT_MIN_WIDTH: f32 = 860.0;
-/// Height kept free under the map for the description of the picked tile.
-const MAP_DETAIL_H: f32 = 92.0;
-/// Name of the tile that stands for the files lying directly in a folder.
-const FILES_TILE: &str = "Files in this folder";
-/// Seconds the new tiles take to grow out of the tile that was opened.
-const ZOOM_SECS: f64 = 0.22;
-
-/// Marks a safety level by shape as well as color: solid for Safe, hatched for Review, outlined for Info.
-fn level_glyph(ui: &mut egui::Ui, level: Confidence, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-    let painter = ui.painter().with_clip_rect(rect);
-    match level {
-        Confidence::Safe => {
-            painter.rect_filled(rect, 2.0, color);
-        }
-        Confidence::Review => {
-            for k in 0..5 {
-                let x = rect.left() + k as f32 * 4.0 - 4.0;
-                painter.line_segment([egui::pos2(x, rect.bottom()), egui::pos2(x + 12.0, rect.top())], egui::Stroke::new(1.5, color));
-            }
-            painter.rect_stroke(rect.shrink(0.75), 2.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
-        }
-        Confidence::Info => {
-            painter.rect_stroke(rect.shrink(0.75), 2.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
-        }
-    }
-}
-const SIZE_W: f32 = 76.0;
-const ITEM_INDENT: f32 = 18.0;
-
-/// A fixed-width table cell, so tags and sizes line up down the list.
-fn cell(ui: &mut egui::Ui, width: f32, layout: egui::Layout, add: impl FnOnce(&mut egui::Ui)) {
-    let size = egui::vec2(width, ui.spacing().interact_size.y);
-    ui.allocate_ui_with_layout(size, layout, |ui| {
-        ui.set_width(width);
-        add(ui);
-    });
-}
-
-fn items(n: usize) -> String {
-    if n == 1 { "1 item".into() } else { format!("{n} items") }
-}
-
-fn paths(n: usize) -> String {
-    if n == 1 { "1 path".into() } else { format!("{n} paths") }
-}
-
-
-/// Most tiles drawn for one folder; the rest are merged into one tile.
-const MAP_TILES: usize = 300;
-
-/// Folders below this share of their parent are merged into one "smaller folders" tile.
-const MAP_MIN_SHARE: u64 = 100;
-
-/// How often the live map is rebuilt from the growing tree.
-const LIVE_MAP_REFRESH: Duration = Duration::from_millis(500);
-
-struct LiveTile {
-    target: Option<usize>,
-    name: String,
-    size: u64,
-    /// The folder has subfolders to open.
-    opens: bool,
-    path: String,
-}
-
-/// One frame of the live map, kept between rebuilds.
-struct LiveSnapshot {
-    trail: Vec<(usize, String)>,
-    size: u64,
-    tiles: Vec<LiveTile>,
-}
-
-struct LiveMap {
-    /// The folder being shown, as a node of the live tree.
-    folder: usize,
-    /// Its subfolders in display order, with sizes (see [`stable_order`]).
-    order: Vec<(usize, u64)>,
-    reordered: Instant,
-    refreshed: Option<Instant>,
-    snapshot: Option<LiveSnapshot>,
-}
-
-impl Default for LiveMap {
-    fn default() -> Self {
-        LiveMap { folder: FolderTree::ROOT, order: Vec::new(), reordered: Instant::now(), refreshed: None, snapshot: None }
-    }
-}
-
-/// Merges fresh sizes (largest first, every key seen so far) into `shown` without making entries jump:
-/// known entries keep their place unless one is overtaken by more than 5%, at most once a second.
-/// A key seen for the first time takes its place at once.
-fn stable_order<K: Eq + std::hash::Hash>(shown: &mut Vec<(K, u64)>, fresh: Vec<(K, u64)>, reordered: &mut Instant) {
-    let grew = fresh.len() > shown.len();
-    if !grew {
-        let sizes: HashMap<&K, u64> = fresh.iter().map(|(k, s)| (k, *s)).collect();
-        for (key, size) in shown.iter_mut() {
-            *size = sizes.get(key).copied().unwrap_or(*size);
-        }
-    }
-    let overtaken = shown.windows(2).any(|w| w[1].1 as f64 > w[0].1 as f64 * 1.05);
-    if grew || overtaken && reordered.elapsed() >= Duration::from_secs(1) {
-        *shown = fresh;
-        *reordered = Instant::now();
-    }
-}
-
-/// The tiles for `folder`: its subfolders in the given order (largest first when sorted), with the small
-/// ones merged into one tile and the files lying directly in the folder as another.
-fn map_tiles(tree: &FolderTree, folder: usize, children: &[(usize, u64)]) -> Vec<(Option<usize>, String, u64)> {
-    let node = tree.node(folder);
-    let threshold = node.size / MAP_MIN_SHARE;
-    let mut tiles = Vec::new();
-    let (mut merged, mut merged_size) = (0usize, 0u64);
-    for (position, (child, size)) in children.iter().enumerate() {
-        if position < MAP_TILES && *size >= threshold.max(1) {
-            tiles.push((Some(*child), tree.node(*child).name.clone(), *size));
-        } else {
-            merged += 1;
-            merged_size += size;
-        }
-    }
-    if merged > 0 && merged_size > 0 {
-        tiles.push((None, format!("{merged} smaller folders"), merged_size));
-    }
-    if node.files_size > 0 {
-        tiles.push((None, FILES_TILE.into(), node.files_size));
-    }
-    tiles
-}
-
-/// What the user asked for in the map besides browsing it.
-enum MapAction {
-    /// Show the items under this folder in the list.
-    ShowInList(String),
-    /// Select every Safe item under this folder.
-    SelectSafe(PathBuf),
-    /// Clear the selection under this folder.
-    ClearHere(PathBuf),
-}
-
-/// What is picked in the map: a folder, one listed file, or the small files of a folder taken together.
-#[derive(Clone, Copy, PartialEq)]
-enum Pick {
-    Folder(usize),
-    File { folder: usize, index: usize },
-    Rest(usize),
-}
-
-impl Pick {
-    fn matches(self, kind: CellKind) -> bool {
-        match (self, kind) {
-            (Pick::Folder(a), CellKind::Folder(b)) | (Pick::Rest(a), CellKind::Rest(b)) => a == b,
-            (Pick::File { folder: a, index: i }, CellKind::File { folder: b, index: j }) => a == b && i == j,
-            _ => false,
-        }
-    }
-}
-
-/// The layout of the current folder, kept until the folder, the size of the map or the sizes change.
-struct MapCache {
-    key: (usize, i32, i32, u64),
-    cells: Vec<Cell>,
-}
-
-/// Where the map is and the way back: folders visited, what is picked, and the zoom into a newly opened folder.
-struct MapState {
-    folder: usize,
-    back: Vec<usize>,
-    forward: Vec<usize>,
-    picked: Option<Pick>,
-    entered: f64,
-    /// Where the opened cell was on screen, so the new cells can grow out of it.
-    from: Option<egui::Rect>,
-    cache: Option<MapCache>,
-    /// The cell the context menu was opened on.
-    menu: Option<usize>,
-}
-
-impl Default for MapState {
-    fn default() -> Self {
-        MapState {
-            folder: FolderTree::ROOT,
-            back: Vec::new(),
-            forward: Vec::new(),
-            picked: None,
-            entered: f64::NEG_INFINITY,
-            from: None,
-            cache: None,
-            menu: None,
-        }
-    }
-}
-
-impl MapState {
-    fn open(&mut self, folder: usize, now: f64, from: Option<egui::Rect>) {
-        if folder != self.folder {
-            self.back.push(self.folder);
-            self.forward.clear();
-            self.arrive(folder, now, from);
-        }
-    }
-
-    fn go_back(&mut self, now: f64) {
-        if let Some(previous) = self.back.pop() {
-            self.forward.push(self.folder);
-            self.arrive(previous, now, None);
-        }
-    }
-
-    fn go_forward(&mut self, now: f64) {
-        if let Some(next) = self.forward.pop() {
-            self.back.push(self.folder);
-            self.arrive(next, now, None);
-        }
-    }
-
-    fn arrive(&mut self, folder: usize, now: f64, from: Option<egui::Rect>) {
-        self.folder = folder;
-        self.picked = None;
-        self.entered = now;
-        self.from = from;
-    }
-}
-
-/// Smallest side, in points, of a rectangle in the map.
-const MAP_MIN_SIDE: f32 = 3.0;
-
-/// The flag a finding gives to `folder` or to a folder above it, which every file inside inherits.
-fn inherited_flag(tree: &FolderTree, folder: usize) -> Option<Confidence> {
-    tree.trail(folder).into_iter().find_map(|id| tree.node(id).flag)
-}
-
-fn flag_text(flag: Option<Confidence>) -> &'static str {
-    match flag {
-        Some(Confidence::Safe) => "Safe to remove.",
-        Some(Confidence::Review) => "Suggested for review.",
-        _ => "Not suggested for removal.",
-    }
-}
-
-/// The folder to open when a cell is clicked, and what to point out in it.
-fn cell_target(kind: CellKind) -> (usize, Option<Pick>) {
-    match kind {
-        CellKind::Folder(id) => (id, None),
-        CellKind::File { folder, index } => (folder, Some(Pick::File { folder, index })),
-        CellKind::Rest(folder) => (folder, Some(Pick::Rest(folder))),
-    }
-}
-
-/// The path a cell stands for.
-fn cell_path(tree: &FolderTree, kind: CellKind) -> PathBuf {
-    match kind {
-        CellKind::Folder(id) | CellKind::Rest(id) => tree.path(id),
-        CellKind::File { folder, index } => tree.node(folder).files.get(index).map_or_else(|| tree.path(folder), |f| tree.path(folder).join(&f.name)),
-    }
-}
-
-fn cell_title(tree: &FolderTree, kind: CellKind) -> String {
-    match kind {
-        CellKind::Folder(id) => tree.node(id).name.clone(),
-        CellKind::File { folder, index } => tree.node(folder).files.get(index).map_or_else(String::new, |f| f.name.clone()),
-        CellKind::Rest(_) => "Smaller files".into(),
-    }
-}
-
-/// Draws the current folder as a nested treemap: every folder holds its subfolders and files, and every
-/// file big enough to see is a rectangle of its own. A click on a rectangle opens the folder it belongs to
-/// and points out the rectangle; the bar under the map says what it is and what can be done with it.
-fn map_view(
-    ui: &mut egui::Ui,
-    tree: &FolderTree,
-    state: &mut MapState,
-    dark: bool,
-    report: &Report,
-    selected: &HashSet<usize>,
-) -> Option<MapAction> {
-    let mut action = None;
-    let now = ui.input(|i| i.time);
-    let folder = state.folder;
-    let trail = tree.trail(folder);
-
-    let typing = ui.ctx().egui_wants_keyboard_input();
-    let (key_back, key_forward) = ui.input(|i| {
-        (
-            i.pointer.button_clicked(egui::PointerButton::Extra1)
-                || (!typing && i.key_pressed(egui::Key::Backspace))
-                || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)),
-            i.pointer.button_clicked(egui::PointerButton::Extra2) || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)),
-        )
-    });
-    ui.horizontal_wrapped(|ui| {
-        if ui.add_enabled(!state.back.is_empty(), egui::Button::new("←")).on_hover_text("Back (Backspace)").clicked() || key_back {
-            state.go_back(now);
-        }
-        if ui.add_enabled(!state.forward.is_empty(), egui::Button::new("→")).on_hover_text("Forward (Alt+Right)").clicked() || key_forward {
-            state.go_forward(now);
-        }
-        let parent = trail.len().checked_sub(2).map(|n| trail[n]);
-        if ui.add_enabled(parent.is_some(), egui::Button::new("↑")).on_hover_text("Up one folder").clicked() {
-            if let Some(parent) = parent {
-                state.open(parent, now, None);
-            }
-        }
-        ui.add_space(6.0);
-        for (n, id) in trail.iter().copied().enumerate() {
-            if n > 0 {
-                ui.label("›");
-            }
-            let name = if n == 0 { tree.path(id).display().to_string() } else { tree.node(id).name.clone() };
-            if ui.selectable_label(id == folder, name).clicked() {
-                state.open(id, now, None);
-            }
-        }
-    });
-    let node = tree.node(folder);
-
-    ui.add_space(4.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(human(node.size)).size(22.0));
-        ui.label(RichText::new("in this folder").weak());
-    });
-    ui.add_space(4.0);
-    if node.size == 0 {
-        ui.label("This folder is empty.");
-        return action;
-    }
-
-    let (_, safe_color, _) = confidence_tag(Confidence::Safe, dark);
-    let (_, review_color, _) = confidence_tag(Confidence::Review, dark);
-    let available = ui.available_size();
-    let (area, response) = ui.allocate_exact_size(egui::vec2(available.x, (available.y - MAP_DETAIL_H).max(160.0)), egui::Sense::click());
-    let progress = ((now - state.entered) / ZOOM_SECS).clamp(0.0, 1.0) as f32;
-    let layout_area = match state.from {
-        Some(from) if progress < 1.0 => {
-            ui.ctx().request_repaint();
-            let t = 1.0 - (1.0 - progress).powi(3);
-            egui::Rect::from_min_max(from.min.lerp(area.min, t), from.max.lerp(area.max, t))
-        }
-        _ => area,
-    };
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let line = ui.text_style_height(&egui::TextStyle::Body) + 2.0;
-
-    let key = (folder, layout_area.width().round() as i32, layout_area.height().round() as i32, tree.revision());
-    let cache = match state.cache.take() {
-        Some(cache) if cache.key == key => cache,
-        _ => {
-            let bounds = Rect { x: 0.0, y: 0.0, w: layout_area.width(), h: layout_area.height() };
-            MapCache { key, cells: layout(tree, folder, bounds, inherited_flag(tree, folder), line + 8.0, MAP_MIN_SIDE) }
-        }
-    };
-    let origin = layout_area.min.to_vec2();
-    let screen = |c: &Cell| egui::Rect::from_min_size(egui::pos2(c.rect.x, c.rect.y) + origin, egui::vec2(c.rect.w, c.rect.h));
-
-    let hovered = response
-        .hover_pos()
-        .and_then(|p| cache.cells.iter().rposition(|c| screen(c).contains(p)));
-
-    let widgets = &ui.visuals().widgets;
-    let file_fill = widgets.inactive.bg_fill;
-    let folder_fill = ui.visuals().extreme_bg_color;
-    let text_color = widgets.inactive.fg_stroke.color;
-    let (safe_fill, review_fill) = (file_fill.lerp_to_gamma(safe_color, 0.6), file_fill.lerp_to_gamma(review_color, 0.6));
-    let (safe_frame, review_frame) = (folder_fill.lerp_to_gamma(safe_color, 0.25), folder_fill.lerp_to_gamma(review_color, 0.25));
-    let strong = ui.visuals().strong_text_color();
-    let painter = ui.painter().with_clip_rect(area);
-    let mut picked_rect = None;
-    for (index, cell) in cache.cells.iter().enumerate() {
-        let rect = screen(cell).shrink(0.5);
-        let is_folder = matches!(cell.kind, CellKind::Folder(_));
-        let fill = match (cell.kind, cell.flag) {
-            (CellKind::Folder(_), Some(Confidence::Safe)) => safe_frame,
-            (CellKind::Folder(_), Some(Confidence::Review)) => review_frame,
-            (CellKind::Folder(_), _) => folder_fill,
-            (CellKind::Rest(_), _) => file_fill.gamma_multiply(0.8),
-            (_, Some(Confidence::Safe)) => safe_fill,
-            (_, Some(Confidence::Review)) => review_fill,
-            _ => file_fill,
-        };
-        let radius = if rect.width() > 12.0 && rect.height() > 12.0 { 3.0 } else { 0.0 };
-        painter.rect_filled(rect, radius, fill);
-        if cell.header {
-            let band = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), line + 8.0));
-            painter.rect_filled(band, egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, Color32::from_black_alpha(60));
-        }
-        if rect.width() > 60.0 && rect.height() > 22.0 && (cell.header || !is_folder) {
-            let text = painter.with_clip_rect(rect);
-            text.text(rect.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, cell_title(tree, cell.kind), font.clone(), text_color);
-            let below = rect.height() > line * 2.0 + 10.0 && !is_folder;
-            if below {
-                text.text(rect.left_top() + egui::vec2(6.0, 4.0 + line), egui::Align2::LEFT_TOP, human(cell.size), font.clone(), text_color.gamma_multiply(0.75));
-            } else if cell.header && rect.width() > 150.0 {
-                text.text(rect.right_top() + egui::vec2(-6.0, 4.0), egui::Align2::RIGHT_TOP, human(cell.size), font.clone(), text_color.gamma_multiply(0.75));
-            }
-        }
-        if state.picked.is_some_and(|p| p.matches(cell.kind)) {
-            picked_rect = Some(rect);
-        }
-        if hovered == Some(index) {
-            painter.rect_stroke(rect, radius, egui::Stroke::new(1.5, strong.gamma_multiply(0.8)), egui::StrokeKind::Inside);
-        }
-    }
-    if let Some(rect) = picked_rect {
-        painter.rect_stroke(rect, 3.0, egui::Stroke::new(3.0, strong), egui::StrokeKind::Inside);
-    }
-
-    let mut enter: Option<(usize, Option<Pick>, egui::Rect)> = None;
-    if let Some(index) = hovered {
-        let cell = &cache.cells[index];
-        if response.clicked() {
-            let (target, pick) = cell_target(cell.kind);
-            enter = Some((target, pick, screen(cell)));
-        }
-        if response.secondary_clicked() {
-            state.menu = Some(index);
-        }
-    }
-    let menu_cell = state.menu.and_then(|i| cache.cells.get(i)).map(|c| (c.kind, screen(c)));
-    response.context_menu(|ui| {
-        let Some((kind, rect)) = menu_cell else {
-            ui.close();
-            return;
-        };
-        if ui.button("Open folder").clicked() {
-            let (target, pick) = cell_target(kind);
-            enter = Some((target, pick, rect));
-            ui.close();
-        }
-        if ui.button("Show in list").clicked() {
-            action = Some(MapAction::ShowInList(cell_path(tree, kind).display().to_string()));
-            ui.close();
-        }
-        if ui.button("Select Safe here").clicked() {
-            action = Some(MapAction::SelectSafe(cell_path(tree, kind)));
-            ui.close();
-        }
-        if ui.button("Clear selection here").clicked() {
-            action = Some(MapAction::ClearHere(cell_path(tree, kind)));
-            ui.close();
-        }
-    });
-    let response = match hovered {
-        Some(index) => {
-            let cell = &cache.cells[index];
-            let flag = match cell.flag {
-                Some(Confidence::Safe) => "\nSafe to remove",
-                Some(Confidence::Review) => "\nSuggested for review",
-                _ => "",
-            };
-            let text = format!("{}\n{}{flag}", cell_path(tree, cell.kind).display(), human(cell.size));
-            response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(text)
-        }
-        None => response,
-    };
-    drop(response);
-    state.cache = Some(cache);
-    if let Some((target, pick, rect)) = enter {
-        state.open(target, now, Some(rect));
-        state.picked = pick;
-        ui.ctx().request_repaint();
-    }
-
-    // What can be done with the picked rectangle, or with this folder when none is picked.
-    let focus = state.picked.and_then(|p| match p {
-        Pick::Folder(id) => Some(CellKind::Folder(id)),
-        Pick::File { folder, index } => tree.node(folder).files.get(index).map(|_| CellKind::File { folder, index }),
-        Pick::Rest(folder) => Some(CellKind::Rest(folder)),
-    });
-    let focus_kind = focus.unwrap_or(CellKind::Folder(folder));
-    let focus_path = cell_path(tree, focus_kind);
-    let (title, size, detail) = match focus_kind {
-        CellKind::Folder(id) => {
-            let n = tree.node(id);
-            let title = if id == FolderTree::ROOT { focus_path.display().to_string() } else { n.name.clone() };
-            (title, n.size, format!("{} Safe, {} Review suggested.", human(n.safe), human(n.review)))
-        }
-        CellKind::File { folder, index } => {
-            let f = &tree.node(folder).files[index];
-            (f.name.clone(), f.size, flag_text(f.flag.or(inherited_flag(tree, folder))).to_string())
-        }
-        CellKind::Rest(id) => {
-            let n = tree.node(id);
-            let listed: u64 = n.files.iter().map(|f| f.size).sum();
-            let note = format!("Too small to show one by one. {}", flag_text(inherited_flag(tree, id)));
-            ("Smaller files".to_string(), n.files_size.saturating_sub(listed), note)
-        }
-    };
-    let here = selected.iter().filter_map(|i| report.findings.get(*i)).filter(|f| f.path.starts_with(&focus_path)).count();
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        // The size comes first so a long name is cut short instead of pushing it out of the panel.
-        ui.label(RichText::new(human(size)).monospace());
-        ui.add(egui::Label::new(RichText::new(&title).strong()).truncate()).on_hover_text(&title);
-    });
-    let detail = format!("{detail} {} selected.", items(here));
-    ui.add(egui::Label::new(RichText::new(&detail).weak()).truncate()).on_hover_text(detail);
-    ui.horizontal(|ui| {
-        if ui.button("Show in list").on_hover_text("Lists the suggested items here.").clicked() {
-            action = Some(MapAction::ShowInList(focus_path.display().to_string()));
-        }
-        if ui.button("Select Safe here").on_hover_text("Selects every Safe item here. Nothing moves until you confirm.").clicked() {
-            action = Some(MapAction::SelectSafe(focus_path.clone()));
-        }
-        if ui.add_enabled(here > 0, egui::Button::new("Clear here")).on_hover_text("Clears the selection here.").clicked() {
-            action = Some(MapAction::ClearHere(focus_path.clone()));
-        }
-    });
-    action
-}
-
-/// A small triangle that points right when the group is collapsed and down when it is open.
-fn disclosure_icon(ui: &mut egui::Ui, open: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-    let c = rect.center();
-    let points = if open {
-        vec![c + egui::vec2(-5.0, -3.0), c + egui::vec2(5.0, -3.0), c + egui::vec2(0.0, 4.0)]
-    } else {
-        vec![c + egui::vec2(-3.0, -5.0), c + egui::vec2(-3.0, 5.0), c + egui::vec2(4.0, 0.0)]
-    };
-    ui.painter().add(egui::Shape::convex_polygon(points, ui.visuals().text_color(), egui::Stroke::NONE));
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Expand or collapse group"));
-    response
-}
-
 /// The colour key and how much was scanned, across the full width so the key never wraps.
 fn scan_notes(ui: &mut egui::Ui, results: &Results) {
     legend_line(ui);
     let skipped = if results.unreadable > 0 { format!(" {} couldn't be read.", paths(results.unreadable)) } else { String::new() };
     ui.label(RichText::new(format!("{} files scanned.{skipped}", results.files)).weak());
-}
-
-/// The three safety levels in one always-visible line, so the colours and shapes are never a guess.
-fn legend_line(ui: &mut egui::Ui) {
-    let dark = ui.visuals().dark_mode;
-    ui.horizontal_wrapped(|ui| {
-        for (level, text) in [
-            (Confidence::Safe, "regenerates itself"),
-            (Confidence::Review, "check it first"),
-            (Confidence::Info, "uninstall only"),
-        ] {
-            let (name, color, _) = confidence_tag(level, dark);
-            level_glyph(ui, level, color);
-            ui.label(name);
-            ui.label(RichText::new(text).weak());
-            ui.add_space(8.0);
-        }
-    });
-}
-
-/// The number from a "Step N of M: …" status line.
-fn scan_step(status: &str) -> Option<usize> {
-    status.strip_prefix("Step ")?.split(' ').next()?.parse().ok()
-}
-
-/// One tick per scan step: finished steps steel, the running one teal, the rest empty.
-fn step_ticks(ui: &mut egui::Ui, step: Option<usize>) {
-    const STEPS: usize = 4;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(STEPS as f32 * 18.0 - 4.0, 14.0), egui::Sense::hover());
-    let widgets = &ui.visuals().widgets;
-    let (done, running, todo) = (
-        widgets.noninteractive.fg_stroke.color.gamma_multiply(0.6),
-        ui.visuals().selection.stroke.color,
-        widgets.noninteractive.bg_stroke.color,
-    );
-    for n in 1..=STEPS {
-        let x = rect.left() + (n - 1) as f32 * 18.0;
-        let tick = egui::Rect::from_center_size(egui::pos2(x + 7.0, rect.center().y), egui::vec2(14.0, 4.0));
-        let color = match step {
-            Some(s) if n < s => done,
-            Some(s) if n == s => running,
-            _ => todo,
-        };
-        ui.painter().rect_filled(tick, 2.0, color);
-    }
-}
-
-/// A line with a teal segment travelling along it. It is the scan's only continuous motion, so a stalled window is visible.
-fn sweep(ui: &mut egui::Ui) {
-    const LENGTH: f64 = 0.22;
-    let (track, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
-    let head = (ui.input(|i| i.time) * 0.5) % (1.0 + LENGTH);
-    let at = |share: f64| track.left() + track.width() * share.clamp(0.0, 1.0) as f32;
-    let segment = egui::Rect::from_min_max(egui::pos2(at(head - LENGTH), track.top()), egui::pos2(at(head), track.bottom()));
-    ui.painter().rect_filled(track, 1.5, ui.visuals().widgets.noninteractive.bg_stroke.color);
-    ui.painter().rect_filled(segment, 1.5, ui.visuals().selection.stroke.color);
-    ui.ctx().request_repaint_after(Duration::from_millis(33));
 }
 
 /// Case-insensitive match on a finding's path or rule name; an empty filter matches everything.
@@ -2011,267 +1214,5 @@ fn matches_filter(finding: &Finding, needle: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::scan_step;
-
-    #[test]
-    fn reads_the_step_number() {
-        assert_eq!(scan_step("Step 2 of 4: applying cleanup rules…"), Some(2));
-        assert_eq!(scan_step("Cancelling…"), None);
-    }
-}
-
-/// Drives the screens the way a person would. Set `DEOX_SCREENS` to also render each one to a PNG
-/// under `target/screens`, which needs a GPU adapter; without it the tests run headless.
-#[cfg(test)]
-mod screens {
-    use super::*;
-    use deox_core::scan::{FileEntry, Index};
-    use egui_kittest::kittest::{NodeT, Queryable};
-    use egui_kittest::{wgpu::WgpuTestRenderer, Harness};
-    use std::fs;
-
-    fn finding(path: &Path, size: u64, category: Category, confidence: Confidence) -> Finding {
-        Finding {
-            path: path.to_path_buf(),
-            size,
-            modified: None,
-            category,
-            confidence,
-            rule: "demo".into(),
-            reason: "Demo finding".into(),
-            uninstall: None,
-        }
-    }
-
-    /// Findings and a folder tree over a made-up scan, so no files are written.
-    struct Demo {
-        findings: Vec<Finding>,
-        tree: FolderTree,
-        files: u64,
-    }
-
-    fn demo_at(root: &Path) -> Demo {
-        let mut files = Vec::new();
-        for i in 0..40u64 {
-            for (name, base, step) in
-                [("Temp/t", 20_000, 3_000), ("Cache/Chrome/c", 60_000, 9_000), ("Projects/app/node_modules/m", 15_000, 2_000), ("Downloads/d", 90_000, 20_000)]
-            {
-                files.push(FileEntry { path: root.join(format!("{name}{i}.bin")), size: base + i * step, modified: None, accessed: None });
-            }
-        }
-        let index = Index { files, ..Default::default() };
-        let findings = vec![
-            finding(&root.join("Temp"), 2_000_000, Category::Temp, Confidence::Safe),
-            finding(&root.join("Cache/Chrome"), 4_000_000, Category::AppCache, Confidence::Safe),
-            finding(&root.join("Projects/app/node_modules"), 1_500_000, Category::DevArtifact, Confidence::Review),
-            finding(&root.join("Downloads/d39.bin"), 870_000, Category::Duplicate, Confidence::Review),
-        ];
-        let tree = FolderTree::build(root, &index, &findings);
-        Demo { files: index.files.len() as u64, findings, tree }
-    }
-
-    fn demo() -> Demo {
-        demo_at(Path::new(r"C:\Demo"))
-    }
-
-    /// Pictures need a GPU, so they are only made when `DEOX_SCREENS` is set.
-    fn pictures() -> bool {
-        std::env::var_os("DEOX_SCREENS").is_some()
-    }
-
-    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Rendering on the GPU from several threads at once crashes, so each test takes turns.
-    fn gpu() -> std::sync::MutexGuard<'static, ()> {
-        GPU.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn harness(size: egui::Vec2, make: impl FnOnce(&mut DeoxApp) + 'static) -> Harness<'static, DeoxApp> {
-        let mut builder = Harness::builder().with_size(size).with_step_dt(0.05).with_max_steps(40).with_context_setup(configure_theme);
-        if pictures() {
-            builder = builder.renderer(WgpuTestRenderer::new());
-        }
-        builder.build_eframe(|cc| {
-            let mut app = DeoxApp::new(cc.egui_ctx.clone());
-            make(&mut app);
-            app
-        })
-    }
-
-    fn results_harness(size: egui::Vec2) -> Harness<'static, DeoxApp> {
-        let Demo { findings, tree, files } = demo();
-        harness(size, move |app| app.set_results(findings, files, 0, Some(tree)))
-    }
-
-    fn shot(harness: &mut Harness<'_, DeoxApp>, name: &str) {
-        harness.run();
-        if !pictures() {
-            return;
-        }
-        let image = harness.render().expect("render");
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/screens");
-        fs::create_dir_all(&dir).unwrap();
-        image.save(dir.join(format!("{name}.png"))).unwrap();
-    }
-
-    const WIDE: egui::Vec2 = egui::vec2(1100.0, 720.0);
-    const NARROW: egui::Vec2 = egui::vec2(720.0, 720.0);
-
-    #[test]
-    fn start_screen() {
-        let _gpu = gpu();
-        let mut h = harness(WIDE, |_| {});
-        shot(&mut h, "home");
-        assert!(h.query_by_label("Scan").is_some());
-        assert!(h.query_by_label("Move to Recycle Bin…").is_none());
-    }
-
-    #[test]
-    fn scan_screen() {
-        let _gpu = gpu();
-        let mut h = harness(WIDE, |app| {
-            app.phase = Phase::Scanning;
-            app.scan_root = r"C:\Users\you".into();
-            app.status = "Step 2 of 4: applying cleanup rules".into();
-            app.files_seen = 123_456;
-            app.bytes_seen = 48_000_000_000;
-            app.scan_folder = r"C:\Users\you\AppData\Local\Temp".into();
-        });
-        shot(&mut h, "scan");
-        assert!(h.query_by_label_contains("Step 2 of 4").is_some());
-        assert!(h.query_by_label("Cancel").is_some());
-        assert!(h.query_by_label_contains("123456 files").is_some());
-    }
-
-    #[test]
-    fn results_screen() {
-        let _gpu = gpu();
-        let mut h = results_harness(WIDE);
-        shot(&mut h, "results");
-        assert!(h.query_by_label("Move to Recycle Bin…").is_some());
-    }
-
-    #[test]
-    fn narrow_window_switches_between_list_and_map() {
-        let _gpu = gpu();
-        let mut h = results_harness(NARROW);
-        shot(&mut h, "results_narrow");
-        assert!(h.query_by_label("Filter:").is_some(), "the list is shown first");
-
-        h.get_by_label("Map").click();
-        shot(&mut h, "results_narrow_map");
-        assert!(h.query_by_label("Filter:").is_none(), "the map replaces the list");
-        assert!(h.state().tab == View::Map);
-    }
-
-    #[test]
-    fn duplicates_start_collapsed_and_come_last() {
-        let _gpu = gpu();
-        let mut h = results_harness(WIDE);
-        h.run();
-        assert!(h.state().collapsed.contains(&Category::Duplicate));
-        assert!(!h.state().collapsed.contains(&Category::Temp));
-        let last = h.state().rows.iter().rev().find_map(|r| match r {
-            Row::Header { category, .. } => Some(*category),
-            Row::Item(_) => None,
-        });
-        assert_eq!(last, Some(Category::Duplicate));
-    }
-
-    #[test]
-    fn only_safe_items_start_selected() {
-        let _gpu = gpu();
-        let mut h = results_harness(WIDE);
-        h.run();
-        let state = h.state();
-        let report = &state.results.as_ref().unwrap().report;
-        assert_eq!(state.selected.len(), 2);
-        assert!(state.selected.iter().all(|i| report.findings[*i].confidence == Confidence::Safe));
-    }
-
-    #[test]
-    fn nothing_selected_disables_the_move_button() {
-        let _gpu = gpu();
-        let mut h = results_harness(WIDE);
-        h.run();
-        assert!(!h.get_by_label("Move to Recycle Bin…").accesskit_node().is_disabled());
-
-        h.get_by_label("Clear").click();
-        h.run();
-
-        assert!(h.state().selected.is_empty());
-        assert!(h.get_by_label("Move to Recycle Bin…").accesskit_node().is_disabled());
-    }
-
-    #[test]
-    fn select_all_safe_restores_the_selection() {
-        let _gpu = gpu();
-        let mut h = results_harness(WIDE);
-        h.run();
-        h.get_by_label("Clear").click();
-        h.run();
-
-        h.get_by_label("Select all Safe").click();
-        h.run();
-
-        assert_eq!(h.state().selected.len(), 2);
-    }
-
-    #[test]
-    fn double_clicking_a_row_shows_it_on_the_map() {
-        let _gpu = gpu();
-        let mut h = results_harness(WIDE);
-        h.run();
-        assert_eq!(h.state().map.folder, FolderTree::ROOT);
-
-        h.get_by_label("Chrome").click();
-        h.step();
-        h.get_by_label("Chrome").click();
-        h.run();
-
-        assert_ne!(h.state().map.folder, FolderTree::ROOT, "the map opens the folder that holds the item");
-        assert!(h.state().map.picked.is_some(), "and points out the item");
-        shot(&mut h, "results_after_double_click");
-    }
-
-    #[test]
-    fn the_map_survives_a_move_to_the_recycle_bin() {
-        let _gpu = gpu();
-        let mut h = results_harness(WIDE);
-        h.run();
-        let gone: HashSet<PathBuf> = h.state().results.as_ref().unwrap().report.findings.iter().take(1).map(|f| f.path.clone()).collect();
-        let before = h.state().results.as_ref().unwrap().tree.as_ref().unwrap().node(FolderTree::ROOT).size;
-
-        h.state_mut().drop_findings(&gone);
-        shot(&mut h, "results_after_move");
-
-        let results = h.state().results.as_ref().unwrap();
-        let tree = results.tree.as_ref().expect("the tree is kept");
-        assert!(tree.node(FolderTree::ROOT).size < before, "its sizes shrink instead of the map disappearing");
-        assert_eq!(results.report.findings.len(), 3);
-    }
-
-    #[test]
-    fn a_long_folder_name_does_not_push_the_size_out_of_the_map_panel() {
-        let _gpu = gpu();
-        let deep = r"AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage\Deeply Nested Folder Name";
-        let root = format!(r"C:\Users\Some Person\{deep}\{deep}");
-        let Demo { findings, tree, files } = demo_at(Path::new(&root));
-        let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(tree)));
-        shot(&mut h, "results_long_name");
-
-        let sizes: Vec<egui::Rect> = h.query_all_by_label_contains("MB").map(|n| n.rect()).filter(|r| r.min.y > 560.0).collect();
-        assert!(!sizes.is_empty(), "the size under the map is shown");
-        assert!(sizes.iter().all(|r| r.max.x <= WIDE.x * 0.6), "and stays inside the map panel: {sizes:?}");
-    }
-
-    #[test]
-    fn results_without_a_map_still_show_the_list() {
-        let _gpu = gpu();
-        let Demo { findings, files, .. } = demo();
-        let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, None));
-        shot(&mut h, "results_no_map");
-        assert!(h.query_by_label("Filter:").is_some());
-    }
-}
+#[path = "screens_test.rs"]
+mod screens;

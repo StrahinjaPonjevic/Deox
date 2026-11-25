@@ -12,7 +12,10 @@ use deox_core::treemap::FolderTree;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+/// How often the scan reports the folder it is in. Time-based, so the path updates steadily on any drive.
+const FOLDER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Smaller files are not worth comparing: they free next to no space and are the slowest part.
 const MIN_DUPLICATE_SIZE: u64 = 64 * 1024;
@@ -97,7 +100,7 @@ pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, cancel: Arc<Cancel>, 
 
 fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow::Result<Analysis> {
     notify.send(Msg::Status("Step 1 of 4: scanning files…".into()));
-    let mut folders = 0u32;
+    let mut last_folder_sent = Instant::now();
     let index = scan_with_folders(
         root,
         cancel,
@@ -108,8 +111,8 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
         },
         |folder| {
             // Folders are far more frequent than the window needs to redraw.
-            folders = folders.wrapping_add(1);
-            if folders.is_multiple_of(200) {
+            if last_folder_sent.elapsed() >= FOLDER_INTERVAL {
+                last_folder_sent = Instant::now();
                 notify.send(Msg::Folder(folder.display().to_string()));
             }
         },

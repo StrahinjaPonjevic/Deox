@@ -5,7 +5,8 @@
 
 use crate::report::{Confidence, Finding};
 use crate::scan::Index;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub struct FolderNode {
@@ -20,11 +21,28 @@ pub struct FolderNode {
     /// Bytes of Safe and Review findings below; together never more than `size`.
     pub safe: u64,
     pub review: u64,
+    /// The largest files directly in this folder, largest first. The rest only count towards `files_size`.
+    pub files: Vec<FileLeaf>,
+    /// Set when a finding covers this whole folder.
+    pub flag: Option<Confidence>,
 }
+
+/// A file listed individually in the map.
+pub struct FileLeaf {
+    pub name: String,
+    pub size: u64,
+    /// Set when a finding covers this file.
+    pub flag: Option<Confidence>,
+}
+
+/// Files kept per folder for the map; the smaller ones are shown as one block.
+const FILES_PER_FOLDER: usize = 250;
 
 pub struct FolderTree {
     root: PathBuf,
     nodes: Vec<FolderNode>,
+    /// Changes whenever sizes change, so a layout computed from the tree can tell it is out of date.
+    revision: u64,
 }
 
 impl FolderTree {
@@ -35,10 +53,38 @@ impl FolderTree {
         let (mut tree, mut lookup) = Self::empty(root);
         let nodes = &mut tree.nodes;
 
+        // Safe wins over Review where both cover the same path.
+        let mut flags: HashMap<&Path, Confidence> = HashMap::new();
+        for finding in findings {
+            match finding.confidence {
+                Confidence::Safe => {
+                    flags.insert(finding.path.as_path(), Confidence::Safe);
+                }
+                Confidence::Review => {
+                    flags.entry(finding.path.as_path()).or_insert(Confidence::Review);
+                }
+                Confidence::Info => {}
+            }
+        }
         for file in &index.files {
             let Some(dir) = file.path.parent() else { continue };
             let id = ensure_folder(nodes, &mut lookup, root, dir);
             nodes[id].files_size += file.size;
+            let name = file.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let files = &mut nodes[id].files;
+            files.push(FileLeaf { name, size: file.size, flag: flags.get(file.path.as_path()).copied() });
+            if files.len() >= FILES_PER_FOLDER * 2 {
+                files.sort_by_key(|f| std::cmp::Reverse(f.size));
+                files.truncate(FILES_PER_FOLDER);
+            }
+        }
+        for node in nodes.iter_mut() {
+            node.files.sort_by_key(|f| std::cmp::Reverse(f.size));
+            node.files.truncate(FILES_PER_FOLDER);
+            node.files.shrink_to_fit();
+        }
+        for (path, id) in &lookup {
+            nodes[*id].flag = flags.get(path.as_path()).copied();
         }
 
         let mut direct_safe = vec![0u64; nodes.len()];
@@ -83,9 +129,9 @@ impl FolderTree {
     /// A tree holding only the root folder, and the lookup from folder path to node.
     fn empty(root: &Path) -> (FolderTree, HashMap<PathBuf, usize>) {
         let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-        let nodes = vec![FolderNode { name, parent: None, children: Vec::new(), files_size: 0, size: 0, safe: 0, review: 0 }];
+        let nodes = vec![FolderNode { name, parent: None, children: Vec::new(), files_size: 0, size: 0, safe: 0, review: 0, files: Vec::new(), flag: None }];
         let lookup = HashMap::from([(root.to_path_buf(), Self::ROOT)]);
-        (FolderTree { root: root.to_path_buf(), nodes }, lookup)
+        (FolderTree { root: root.to_path_buf(), nodes, revision: 0 }, lookup)
     }
 
     /// The subfolders of `id` with their sizes, largest first. Trees from [`FolderTree::build`] keep them
@@ -109,6 +155,88 @@ impl FolderTree {
             current = parent;
         }
         names.iter().rev().fold(self.root.clone(), |path, name| path.join(name))
+    }
+
+    /// Changes whenever the sizes in the tree change.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Position of the file called `name` among the files listed for `folder`.
+    pub fn file_index(&self, folder: usize, name: &OsStr) -> Option<usize> {
+        self.nodes[folder].files.iter().position(|f| OsStr::new(&f.name) == name)
+    }
+
+    /// The deepest known folder on `path`, and whether the whole path is a known folder.
+    pub fn locate(&self, path: &Path) -> (usize, bool) {
+        let Ok(relative) = path.strip_prefix(&self.root) else { return (Self::ROOT, false) };
+        let mut current = Self::ROOT;
+        for part in relative.components() {
+            let next = self.nodes[current].children.iter().copied().find(|c| OsStr::new(&self.nodes[*c].name) == part.as_os_str());
+            match next {
+                Some(child) => current = child,
+                None => return (current, false),
+            }
+        }
+        (current, true)
+    }
+
+    /// Removes several findings at once. A path inside another removed path is already gone with it, and a
+    /// path listed twice counts once.
+    pub fn remove_all(&mut self, removed: &[(&Path, u64, Confidence)]) {
+        let paths: HashSet<&Path> = removed.iter().map(|r| r.0).collect();
+        let mut seen: HashSet<&Path> = HashSet::new();
+        for (path, size, confidence) in removed {
+            if !path.ancestors().skip(1).any(|a| paths.contains(a)) && seen.insert(path) {
+                self.remove(path, *size, *confidence);
+            }
+        }
+    }
+
+    /// Takes a finding that was moved away out of the sizes, so the map stays right without a new scan.
+    /// A path that is a known folder removes the whole folder; any other path is a file in the deepest known folder.
+    pub fn remove(&mut self, path: &Path, size: u64, confidence: Confidence) {
+        self.revision += 1;
+        let (id, is_folder) = self.locate(path);
+        let (removed, safe, review, mut cursor) = if is_folder {
+            if id == Self::ROOT {
+                return;
+            }
+            let node = &self.nodes[id];
+            let (removed, safe, review, parent) = (node.size, node.safe, node.review, node.parent);
+            let mut stack = vec![id];
+            while let Some(n) = stack.pop() {
+                let node = &mut self.nodes[n];
+                (node.size, node.files_size, node.safe, node.review) = (0, 0, 0, 0);
+                node.files.clear();
+                stack.extend(node.children.iter().copied());
+            }
+            (removed, safe, review, parent)
+        } else {
+            let node = &mut self.nodes[id];
+            node.files_size = node.files_size.saturating_sub(size);
+            if let Some(name) = path.file_name() {
+                if let Some(at) = node.files.iter().position(|f| OsStr::new(&f.name) == name) {
+                    node.files.remove(at);
+                }
+            }
+            let (safe, review) = match confidence {
+                Confidence::Safe => (size, 0),
+                Confidence::Review => (0, size),
+                _ => (0, 0),
+            };
+            (size, safe, review, Some(id))
+        };
+        while let Some(a) = cursor {
+            let node = &mut self.nodes[a];
+            node.size = node.size.saturating_sub(removed);
+            node.safe = node.safe.saturating_sub(safe).min(node.size);
+            node.review = node.review.saturating_sub(review).min(node.size - node.safe);
+            cursor = node.parent;
+            let mut children = std::mem::take(&mut self.nodes[a].children);
+            children.sort_by_key(|c| std::cmp::Reverse(self.nodes[*c].size));
+            self.nodes[a].children = children;
+        }
     }
 
     /// The folders from the scan root down to `id`, root first.
@@ -182,7 +310,7 @@ fn ensure_folder(nodes: &mut Vec<FolderNode>, lookup: &mut HashMap<PathBuf, usiz
     for path in missing.into_iter().rev() {
         let id = nodes.len();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        nodes.push(FolderNode { name, parent: Some(parent_id), children: Vec::new(), files_size: 0, size: 0, safe: 0, review: 0 });
+        nodes.push(FolderNode { name, parent: Some(parent_id), children: Vec::new(), files_size: 0, size: 0, safe: 0, review: 0, files: Vec::new(), flag: None });
         nodes[parent_id].children.push(id);
         lookup.insert(path.to_path_buf(), id);
         parent_id = id;
@@ -251,4 +379,74 @@ fn worst(areas: &[f64], sum: f64, side: f64) -> f64 {
     let (min, max) = areas.iter().fold((f64::MAX, 0.0f64), |(lo, hi), a| (lo.min(*a), hi.max(*a)));
     let square = side * side;
     (square * max / (sum * sum)).max(sum * sum / (square * min))
+}
+
+/// What a cell of [`layout`] stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellKind {
+    Folder(usize),
+    File { folder: usize, index: usize },
+    /// The files of a folder that are too small to be listed one by one.
+    Rest(usize),
+}
+
+/// One rectangle of the nested map. A folder's cell comes before the cells inside it.
+#[derive(Debug, Clone, Copy)]
+pub struct Cell {
+    pub rect: Rect,
+    pub kind: CellKind,
+    pub size: u64,
+    /// Set when a finding covers this cell, directly or through a folder above it.
+    pub flag: Option<Confidence>,
+    /// Whether the top of a folder's cell is kept free for its name.
+    pub header: bool,
+}
+
+/// Lays out `folder` inside `bounds` with every subfolder and every listed file as a rectangle, folders
+/// nested inside their parents. Rectangles narrower than `min_side` are left out; a folder that is too
+/// small to show its contents stays one rectangle. `inherited` is the flag of `folder` and the folders above it.
+pub fn layout(tree: &FolderTree, folder: usize, bounds: Rect, inherited: Option<Confidence>, header: f32, min_side: f32) -> Vec<Cell> {
+    let mut cells = Vec::new();
+    fill(tree, folder, bounds, inherited, header, min_side, &mut cells);
+    cells
+}
+
+fn fill(tree: &FolderTree, folder: usize, bounds: Rect, inherited: Option<Confidence>, header: f32, min_side: f32, out: &mut Vec<Cell>) {
+    let node = &tree.nodes[folder];
+    let mut items: Vec<(CellKind, u64, Option<Confidence>)> = Vec::with_capacity(node.children.len() + node.files.len() + 1);
+    for &child in &node.children {
+        let n = &tree.nodes[child];
+        if n.size > 0 {
+            items.push((CellKind::Folder(child), n.size, n.flag.or(inherited)));
+        }
+    }
+    for (index, file) in node.files.iter().enumerate() {
+        items.push((CellKind::File { folder, index }, file.size, file.flag.or(inherited)));
+    }
+    let listed: u64 = node.files.iter().map(|f| f.size).sum();
+    let rest = node.files_size.saturating_sub(listed);
+    if rest > 0 {
+        items.push((CellKind::Rest(folder), rest, inherited));
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item.1));
+    let sizes: Vec<u64> = items.iter().map(|item| item.1).collect();
+    for ((kind, size, flag), rect) in items.into_iter().zip(squarify(&sizes, bounds)) {
+        if rect.w < min_side || rect.h < min_side {
+            continue;
+        }
+        let mut cell = Cell { rect, kind, size, flag, header: false };
+        let CellKind::Folder(child) = kind else {
+            out.push(cell);
+            continue;
+        };
+        const PAD: f32 = 2.0;
+        let band = if rect.h >= header * 3.0 && rect.w >= header * 3.0 { header } else { 0.0 };
+        let top = rect.y + if band > 0.0 { band } else { PAD };
+        let inner = Rect { x: rect.x + PAD, y: top, w: rect.w - 2.0 * PAD, h: rect.y + rect.h - PAD - top };
+        cell.header = band > 0.0;
+        out.push(cell);
+        if inner.w >= min_side * 2.0 && inner.h >= min_side * 2.0 {
+            fill(tree, child, inner, flag, header, min_side, out);
+        }
+    }
 }

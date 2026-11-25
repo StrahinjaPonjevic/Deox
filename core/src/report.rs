@@ -59,7 +59,7 @@ impl Report {
         self.findings.iter().map(|f| f.size).sum()
     }
 
-    /// Groups by category, the group with the most reclaimable space first.
+    /// Groups by category, the group with the most reclaimable space first and duplicates last.
     pub fn groups(&self) -> Vec<CategoryGroup<'_>> {
         let mut sorted: Vec<(usize, &Finding)> = self.findings.iter().enumerate().collect();
         sorted.sort_by_key(|(_, f)| std::cmp::Reverse(f.size));
@@ -77,7 +77,8 @@ impl Report {
                 }),
             }
         }
-        groups.sort_by_key(|g| std::cmp::Reverse(g.total_size));
+        // Duplicates always need a manual choice, so they come after what can be cleaned up at once.
+        groups.sort_by_key(|g| (g.category == Category::Duplicate, std::cmp::Reverse(g.total_size)));
         groups
     }
 }

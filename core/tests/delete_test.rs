@@ -257,6 +257,16 @@ fn report_groups_by_category_and_sums_sizes() {
     assert_eq!(groups[1].items.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![2, 0]);
 }
 
+#[test]
+fn report_lists_duplicates_after_larger_groups() {
+    let make = |category, size| Finding { category, size, ..finding_stub() };
+    let report = Report::new(vec![make(Category::Duplicate, 9000), make(Category::Temp, 100)]);
+
+    let order: Vec<_> = report.groups().iter().map(|g| g.category).collect();
+
+    assert_eq!(order, vec![Category::Temp, Category::Duplicate]);
+}
+
 fn finding_stub() -> Finding {
     Finding {
         path: PathBuf::from("x"),

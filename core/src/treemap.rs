@@ -32,14 +32,12 @@ impl FolderTree {
 
     /// Aggregates the scanned files by folder and marks how much of each folder the findings cover.
     pub fn build(root: &Path, index: &Index, findings: &[Finding]) -> FolderTree {
-        let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-        let mut nodes = vec![FolderNode { name, parent: None, children: Vec::new(), files_size: 0, size: 0, safe: 0, review: 0 }];
-        let mut lookup: HashMap<PathBuf, usize> = HashMap::new();
-        lookup.insert(root.to_path_buf(), Self::ROOT);
+        let (mut tree, mut lookup) = Self::empty(root);
+        let nodes = &mut tree.nodes;
 
         for file in &index.files {
             let Some(dir) = file.path.parent() else { continue };
-            let id = ensure_folder(&mut nodes, &mut lookup, root, dir);
+            let id = ensure_folder(nodes, &mut lookup, root, dir);
             nodes[id].files_size += file.size;
         }
 
@@ -79,7 +77,23 @@ impl FolderTree {
             children.sort_by_key(|c| std::cmp::Reverse(nodes[*c].size));
             nodes[i].children = children;
         }
-        FolderTree { root: root.to_path_buf(), nodes }
+        tree
+    }
+
+    /// A tree holding only the root folder, and the lookup from folder path to node.
+    fn empty(root: &Path) -> (FolderTree, HashMap<PathBuf, usize>) {
+        let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let nodes = vec![FolderNode { name, parent: None, children: Vec::new(), files_size: 0, size: 0, safe: 0, review: 0 }];
+        let lookup = HashMap::from([(root.to_path_buf(), Self::ROOT)]);
+        (FolderTree { root: root.to_path_buf(), nodes }, lookup)
+    }
+
+    /// The subfolders of `id` with their sizes, largest first. Trees from [`FolderTree::build`] keep them
+    /// sorted already; a [`LiveTree`] does not.
+    pub fn children_by_size(&self, id: usize) -> Vec<(usize, u64)> {
+        let mut children: Vec<(usize, u64)> = self.nodes[id].children.iter().map(|c| (*c, self.nodes[*c].size)).collect();
+        children.sort_by_key(|c| std::cmp::Reverse(c.1));
+        children
     }
 
     pub fn node(&self, id: usize) -> &FolderNode {
@@ -105,6 +119,46 @@ impl FolderTree {
         }
         trail.reverse();
         trail
+    }
+}
+
+/// A [`FolderTree`] that grows file by file while a scan runs, so a map can be drawn from it before the
+/// scan ends. Sizes are kept up to date on every ancestor; children are not kept sorted (see
+/// [`FolderTree::children_by_size`]) and there are no findings yet.
+pub struct LiveTree {
+    tree: FolderTree,
+    lookup: HashMap<PathBuf, usize>,
+    /// Files arrive folder by folder, so the previous folder usually answers without a lookup.
+    last: Option<(PathBuf, usize)>,
+}
+
+impl LiveTree {
+    pub fn new(root: &Path) -> LiveTree {
+        let (tree, lookup) = FolderTree::empty(root);
+        LiveTree { tree, lookup, last: None }
+    }
+
+    pub fn add(&mut self, path: &Path, size: u64) {
+        let Some(dir) = path.parent() else { return };
+        let id = match &self.last {
+            Some((last, id)) if last == dir => *id,
+            _ => {
+                let id = ensure_folder(&mut self.tree.nodes, &mut self.lookup, &self.tree.root, dir);
+                self.last = Some((dir.to_path_buf(), id));
+                id
+            }
+        };
+        let nodes = &mut self.tree.nodes;
+        nodes[id].files_size += size;
+        let mut current = Some(id);
+        while let Some(i) = current {
+            nodes[i].size += size;
+            current = nodes[i].parent;
+        }
+    }
+
+    pub fn tree(&self) -> &FolderTree {
+        &self.tree
     }
 }
 

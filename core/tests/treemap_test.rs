@@ -1,6 +1,6 @@
 use deox_core::report::{Category, Confidence, Finding};
 use deox_core::scan::{scan, Cancel};
-use deox_core::treemap::{squarify, FolderTree, Rect};
+use deox_core::treemap::{squarify, FolderTree, LiveTree, Rect};
 use std::fs;
 use std::path::Path;
 
@@ -136,4 +136,41 @@ fn layout_keeps_shapes_reasonably_square() {
 
     let worst = rects.iter().map(|r| (r.w / r.h).max(r.h / r.w)).fold(0.0f32, f32::max);
     assert!(worst < 6.0, "worst aspect ratio {worst}");
+}
+
+#[test]
+fn live_tree_matches_the_tree_built_after_the_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("top.bin"), 5);
+    write(&dir.path().join("a/one.bin"), 100);
+    write(&dir.path().join("a/deep/two.bin"), 50);
+    write(&dir.path().join("a/three.bin"), 7);
+    write(&dir.path().join("b/four.bin"), 20);
+    let mut live = LiveTree::new(dir.path());
+    let index = scan(dir.path(), &Cancel::default(), |_, _, file| live.add(&file.path, file.size));
+    let built = FolderTree::build(dir.path(), &index, &[]);
+
+    let live = live.tree();
+    assert_eq!(live.node(FolderTree::ROOT).size, built.node(FolderTree::ROOT).size);
+    assert_eq!(live.node(FolderTree::ROOT).files_size, 5);
+    let sizes = |tree: &FolderTree| -> Vec<(String, u64)> {
+        tree.children_by_size(FolderTree::ROOT).into_iter().map(|(c, s)| (tree.node(c).name.clone(), s)).collect()
+    };
+    assert_eq!(sizes(live), sizes(&built));
+    assert_eq!(sizes(live), vec![("a".to_string(), 157), ("b".to_string(), 20)]);
+}
+
+#[test]
+fn live_tree_sizes_are_usable_midway_and_files_in_alternating_folders_count_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut live = LiveTree::new(dir.path());
+
+    live.add(&dir.path().join("a/x.bin"), 10);
+    live.add(&dir.path().join("b/y.bin"), 4);
+    live.add(&dir.path().join("a/z.bin"), 1);
+
+    let tree = live.tree();
+    assert_eq!(tree.node(FolderTree::ROOT).size, 15);
+    let by_size = tree.children_by_size(FolderTree::ROOT);
+    assert_eq!(by_size.iter().map(|c| c.1).collect::<Vec<_>>(), vec![11, 4]);
 }

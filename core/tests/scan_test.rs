@@ -1,4 +1,4 @@
-use deox_core::scan::{first_level, scan, walk, Cancel};
+use deox_core::scan::{scan, walk, Cancel};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -133,22 +133,4 @@ fn progress_reports_every_file_and_its_size() {
     scan(dir.path(), &Cancel::default(), |seen, bytes, _| last = (seen, bytes));
 
     assert_eq!(last, (4, 40));
-}
-
-#[test]
-fn progress_files_add_up_per_first_level_folder() {
-    let dir = tempfile::tempdir().unwrap();
-    write(&dir.path().join("a/x.txt"), 10);
-    write(&dir.path().join("a/deep/y.txt"), 5);
-    write(&dir.path().join("b/z.txt"), 7);
-    write(&dir.path().join("loose.txt"), 100);
-    let mut sums = std::collections::BTreeMap::new();
-
-    scan(dir.path(), &Cancel::default(), |_, _, file| {
-        if let Some(name) = first_level(dir.path(), &file.path) {
-            *sums.entry(name.to_string_lossy().into_owned()).or_insert(0u64) += file.size;
-        }
-    });
-
-    assert_eq!(sums.into_iter().collect::<Vec<_>>(), vec![("a".to_string(), 15), ("b".to_string(), 7)]);
 }

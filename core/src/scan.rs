@@ -39,13 +39,6 @@ pub struct Index {
     pub cancelled: bool,
 }
 
-/// The folder directly under `root` that holds `path`; `None` for files lying directly in `root`.
-pub fn first_level<'a>(root: &Path, path: &'a Path) -> Option<&'a std::ffi::OsStr> {
-    let mut parts = path.strip_prefix(root).ok()?.components();
-    let first = parts.next()?;
-    parts.next().map(|_| first.as_os_str())
-}
-
 /// Walks `root` in parallel and indexes every regular file.
 /// Links and junctions are not entered. Unreadable entries are recorded in
 /// `Index::errors` and never abort the scan.

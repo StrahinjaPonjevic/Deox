@@ -5,13 +5,13 @@ mod worker;
 use deox_core::delete::{launch_uninstaller, DeleteReport, Outcome};
 use deox_core::report::{Category, Confidence, Finding, Report};
 use deox_core::scan::Cancel;
-use deox_core::treemap::{squarify, FolderTree, Rect};
+use deox_core::treemap::{squarify, FolderTree, LiveTree, Rect};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use worker::{Msg, Notifier};
 
@@ -128,6 +128,11 @@ struct DeoxApp {
     /// Largest folders under the scan root so far, in display order (see `merge_live_folders`).
     live_folders: Vec<(String, u64)>,
     live_reordered: Instant,
+    /// The scan's folder tree as it grows, shared with the worker that fills it.
+    live_tree: Option<Arc<Mutex<LiveTree>>>,
+    /// List or map of the folders while scanning. The list stays the default until the map is proven on a large drive.
+    scan_view: View,
+    live_map: LiveMap,
     /// Items settled and total while a move or check is running.
     move_progress: (usize, usize),
     move_cancel: Arc<Cancel>,
@@ -210,6 +215,9 @@ impl DeoxApp {
             bytes_seen: 0,
             live_folders: Vec::new(),
             live_reordered: Instant::now(),
+            live_tree: None,
+            scan_view: View::List,
+            live_map: LiveMap::default(),
             move_progress: (0, 0),
             move_cancel: Arc::new(Cancel::default()),
             filter: String::new(),
@@ -258,12 +266,15 @@ impl DeoxApp {
         self.files_seen = 0;
         self.bytes_seen = 0;
         self.live_folders.clear();
+        self.live_map = LiveMap::default();
+        let live = Arc::new(Mutex::new(LiveTree::new(&root)));
+        self.live_tree = Some(live.clone());
         self.scan_folder.clear();
         self.status = "Starting scan…".into();
         self.results = None;
         self.rows.clear();
         self.selected.clear();
-        worker::spawn_analysis(root, self.cancel.clone(), self.notifier());
+        worker::spawn_analysis(root, self.cancel.clone(), live, self.notifier());
     }
 
     fn modal_open(&self) -> bool {
@@ -314,17 +325,104 @@ impl DeoxApp {
     /// jump: known rows keep their place unless one is overtaken by more than 5%, at most once a second.
     /// A folder seen for the first time takes its place at once.
     fn merge_live_folders(&mut self, folders: Vec<(String, u64)>) {
-        let grew = folders.len() > self.live_folders.len();
-        if !grew {
-            let sizes: HashMap<&str, u64> = folders.iter().map(|(n, s)| (n.as_str(), *s)).collect();
-            for (name, size) in &mut self.live_folders {
-                *size = sizes.get(name.as_str()).copied().unwrap_or(*size);
+        stable_order(&mut self.live_folders, folders, &mut self.live_reordered);
+    }
+
+    /// Rebuilds what the live map shows, at most twice a second, so tiles do not flicker while sizes grow.
+    fn refresh_live_map(&mut self) {
+        let Some(live) = self.live_tree.clone() else { return };
+        if self.live_map.refreshed.is_some_and(|t| t.elapsed() < LIVE_MAP_REFRESH) {
+            return;
+        }
+        let live = live.lock().unwrap_or_else(|e| e.into_inner());
+        let tree = live.tree();
+        let map = &mut self.live_map;
+        stable_order(&mut map.order, tree.children_by_size(map.folder), &mut map.reordered);
+        let tiles = map_tiles(tree, map.folder, &map.order)
+            .into_iter()
+            .map(|(target, name, size)| LiveTile {
+                path: target.map_or_else(|| name.clone(), |c| tree.path(c).display().to_string()),
+                opens: target.is_some_and(|c| !tree.node(c).children.is_empty()),
+                target,
+                name,
+                size,
+            })
+            .collect();
+        let trail = tree.trail(map.folder);
+        let trail = trail
+            .iter()
+            .enumerate()
+            .map(|(n, id)| (*id, if n == 0 { tree.path(*id).display().to_string() } else { tree.node(*id).name.clone() }))
+            .collect();
+        map.snapshot = Some(LiveSnapshot { trail, size: tree.node(map.folder).size, tiles });
+        map.refreshed = Some(Instant::now());
+    }
+
+    /// The folder tree so far as a treemap. Tiles are plain: nothing has been judged yet, so there is no
+    /// Safe/Review stripe, and a click opens a folder the same way as in the finished map.
+    fn live_map_view(&mut self, ui: &mut egui::Ui) {
+        self.refresh_live_map();
+        ui.ctx().request_repaint_after(LIVE_MAP_REFRESH);
+        let Some(snapshot) = &self.live_map.snapshot else { return };
+        let mut open = None;
+        ui.horizontal_wrapped(|ui| {
+            for (n, (id, name)) in snapshot.trail.iter().enumerate() {
+                if n > 0 {
+                    ui.label("›");
+                }
+                if ui.selectable_label(n + 1 == snapshot.trail.len(), name).clicked() {
+                    open = Some(*id);
+                }
+            }
+        });
+        ui.label(RichText::new(format!("{} so far. Sizes are still growing.", human(snapshot.size))).weak());
+        ui.add_space(4.0);
+        if snapshot.tiles.is_empty() {
+            ui.label("Nothing measured in this folder yet.");
+        }
+
+        let available = ui.available_size();
+        let (area, _) = ui.allocate_exact_size(egui::vec2(available.x, available.y.max(160.0)), egui::Sense::hover());
+        let sizes: Vec<u64> = snapshot.tiles.iter().map(|t| t.size).collect();
+        let rects = squarify(&sizes, Rect { x: area.min.x, y: area.min.y, w: area.width(), h: area.height() });
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let line = ui.text_style_height(&egui::TextStyle::Body) + 2.0;
+        for (index, (t, r)) in snapshot.tiles.iter().zip(&rects).enumerate() {
+            let tile = egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h)).shrink(1.0);
+            if tile.width() < 2.0 || tile.height() < 2.0 {
+                continue;
+            }
+            let opens = t.target.is_some() && t.opens;
+            let sense = if opens { egui::Sense::click() } else { egui::Sense::hover() };
+            let response = ui.interact(tile, ui.auto_id_with(("live_tile", index)), sense);
+            let widgets = &ui.visuals().widgets;
+            let (fill, text_color) = if response.hovered() {
+                (widgets.hovered.bg_fill, widgets.hovered.fg_stroke.color)
+            } else {
+                (widgets.inactive.bg_fill, widgets.inactive.fg_stroke.color)
+            };
+            let painter = ui.painter().with_clip_rect(tile);
+            painter.rect_filled(tile, 2.0, fill);
+            if tile.width() > 56.0 && tile.height() > 24.0 {
+                painter.text(tile.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, &t.name, font.clone(), text_color);
+                if tile.height() > 24.0 + line {
+                    painter.text(tile.left_top() + egui::vec2(6.0, 4.0 + line), egui::Align2::LEFT_TOP, human(t.size), font.clone(), text_color.gamma_multiply(0.8));
+                }
+            }
+            if opens {
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{}, {}", t.name, human(t.size))));
+            }
+            let clicked = response.clicked();
+            let hint = if opens { "\nClick to open." } else { "" };
+            let response = if opens { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };
+            response.on_hover_text(format!("{}\n{}{hint}", t.path, human(t.size)));
+            if clicked {
+                open = t.target;
             }
         }
-        let overtaken = self.live_folders.windows(2).any(|w| w[1].1 as f64 > w[0].1 as f64 * 1.05);
-        if grew || overtaken && self.live_reordered.elapsed() >= Duration::from_secs(1) {
-            self.live_folders = folders;
-            self.live_reordered = Instant::now();
+        if let Some(folder) = open {
+            self.live_map = LiveMap { folder, ..LiveMap::default() };
+            ui.ctx().request_repaint();
         }
     }
 
@@ -384,6 +482,8 @@ impl DeoxApp {
             Msg::Moved(done, total) => self.move_progress = (done, total),
             Msg::Analysis(a) => {
                 self.phase = Phase::Idle;
+                self.live_tree = None;
+                self.live_map = LiveMap::default();
                 self.files_seen = a.files;
                 if a.cancelled {
                     self.status = "Scan cancelled.".into();
@@ -403,6 +503,8 @@ impl DeoxApp {
             }
             Msg::Failed(message) => {
                 self.phase = Phase::Idle;
+                self.live_tree = None;
+                self.live_map = LiveMap::default();
                 self.error = Some(message);
             }
         }
@@ -515,8 +617,9 @@ impl DeoxApp {
 
     fn central(&mut self, ui: &mut egui::Ui) {
         if self.phase != Phase::Idle {
+            let mapping = self.phase == Phase::Scanning && self.scan_view == View::Map;
             ui.vertical_centered(|ui| {
-                ui.add_space(120.0);
+                ui.add_space(if mapping { 12.0 } else { 120.0 });
                 ui.spinner();
                 ui.add_space(8.0);
                 ui.label(&self.status);
@@ -526,7 +629,16 @@ impl DeoxApp {
                     if !self.scan_folder.is_empty() {
                         ui.add(egui::Label::new(RichText::new(&self.scan_folder).weak().small()).truncate());
                     }
-                    self.live_folder_list(ui);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.scan_view, View::List, "List");
+                        ui.selectable_value(&mut self.scan_view, View::Map, "Map");
+                    });
+                    if mapping {
+                        self.live_map_view(ui);
+                    } else {
+                        self.live_folder_list(ui);
+                    }
                 } else {
                     let (done, total) = self.move_progress;
                     if total > 0 {
@@ -1310,6 +1422,83 @@ const MAP_TILES: usize = 300;
 /// Folders below this share of their parent are merged into one "smaller folders" tile.
 const MAP_MIN_SHARE: u64 = 100;
 
+/// How often the live map is rebuilt from the growing tree.
+const LIVE_MAP_REFRESH: Duration = Duration::from_millis(500);
+
+struct LiveTile {
+    target: Option<usize>,
+    name: String,
+    size: u64,
+    /// The folder has subfolders to open.
+    opens: bool,
+    path: String,
+}
+
+/// One frame of the live map, kept between rebuilds.
+struct LiveSnapshot {
+    trail: Vec<(usize, String)>,
+    size: u64,
+    tiles: Vec<LiveTile>,
+}
+
+struct LiveMap {
+    /// The folder being shown, as a node of the live tree.
+    folder: usize,
+    /// Its subfolders in display order, with sizes (see [`stable_order`]).
+    order: Vec<(usize, u64)>,
+    reordered: Instant,
+    refreshed: Option<Instant>,
+    snapshot: Option<LiveSnapshot>,
+}
+
+impl Default for LiveMap {
+    fn default() -> Self {
+        LiveMap { folder: FolderTree::ROOT, order: Vec::new(), reordered: Instant::now(), refreshed: None, snapshot: None }
+    }
+}
+
+/// Merges fresh sizes (largest first, every key seen so far) into `shown` without making entries jump:
+/// known entries keep their place unless one is overtaken by more than 5%, at most once a second.
+/// A key seen for the first time takes its place at once.
+fn stable_order<K: Eq + std::hash::Hash>(shown: &mut Vec<(K, u64)>, fresh: Vec<(K, u64)>, reordered: &mut Instant) {
+    let grew = fresh.len() > shown.len();
+    if !grew {
+        let sizes: HashMap<&K, u64> = fresh.iter().map(|(k, s)| (k, *s)).collect();
+        for (key, size) in shown.iter_mut() {
+            *size = sizes.get(key).copied().unwrap_or(*size);
+        }
+    }
+    let overtaken = shown.windows(2).any(|w| w[1].1 as f64 > w[0].1 as f64 * 1.05);
+    if grew || overtaken && reordered.elapsed() >= Duration::from_secs(1) {
+        *shown = fresh;
+        *reordered = Instant::now();
+    }
+}
+
+/// The tiles for `folder`: its subfolders in the given order (largest first when sorted), with the small
+/// ones merged into one tile and the files lying directly in the folder as another.
+fn map_tiles(tree: &FolderTree, folder: usize, children: &[(usize, u64)]) -> Vec<(Option<usize>, String, u64)> {
+    let node = tree.node(folder);
+    let threshold = node.size / MAP_MIN_SHARE;
+    let mut tiles = Vec::new();
+    let (mut merged, mut merged_size) = (0usize, 0u64);
+    for (position, (child, size)) in children.iter().enumerate() {
+        if position < MAP_TILES && *size >= threshold.max(1) {
+            tiles.push((Some(*child), tree.node(*child).name.clone(), *size));
+        } else {
+            merged += 1;
+            merged_size += size;
+        }
+    }
+    if merged > 0 && merged_size > 0 {
+        tiles.push((None, format!("{merged} smaller folders"), merged_size));
+    }
+    if node.files_size > 0 {
+        tiles.push((None, "Files in this folder".into(), node.files_size));
+    }
+    tiles
+}
+
 /// What the user asked for in the map besides browsing it.
 enum MapAction {
     /// Show the items under this folder in the list.
@@ -1403,24 +1592,8 @@ fn map_view(
     }
     ui.add_space(4.0);
 
-    let threshold = node.size / MAP_MIN_SHARE;
-    let mut tiles: Vec<(Option<usize>, String, u64)> = Vec::new();
-    let (mut merged, mut merged_size) = (0usize, 0u64);
-    for (position, child) in node.children.iter().enumerate() {
-        let size = tree.node(*child).size;
-        if position < MAP_TILES && size >= threshold.max(1) {
-            tiles.push((Some(*child), tree.node(*child).name.clone(), size));
-        } else {
-            merged += 1;
-            merged_size += size;
-        }
-    }
-    if merged > 0 && merged_size > 0 {
-        tiles.push((None, format!("{merged} smaller folders"), merged_size));
-    }
-    if node.files_size > 0 {
-        tiles.push((None, "Files in this folder".into(), node.files_size));
-    }
+    let children: Vec<(usize, u64)> = node.children.iter().map(|c| (*c, tree.node(*c).size)).collect();
+    let mut tiles = map_tiles(tree, *folder, &children);
     tiles.sort_by_key(|t| std::cmp::Reverse(t.2));
     if tiles.is_empty() {
         ui.label("This folder is empty.");
@@ -1490,7 +1663,9 @@ fn map_view(
             painter.add(egui::Shape::convex_polygon(points, text_color.gamma_multiply(0.7), egui::Stroke::NONE));
         }
         if let Some(c) = target {
-            response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{name}, {}", human(*size))));
+            if opens {
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{name}, {}", human(*size))));
+            }
             let hint = if opens { "\nClick to open." } else { "" };
             let clicked = response.clicked();
             let response = if opens { response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { response };

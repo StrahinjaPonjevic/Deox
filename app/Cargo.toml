@@ -8,3 +8,6 @@ anyhow = "1.0.104"
 deox-core = { path = "../core" }
 eframe = "0.37.0"
 rfd = "0.18.0"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "eframe", "snapshot"] }

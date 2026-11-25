@@ -431,7 +431,7 @@ impl DeoxApp {
         let Some(largest) = self.live_folders.iter().map(|f| f.1).max().filter(|m| *m > 0) else { return };
         ui.add_space(12.0);
         ui.label(RichText::new("Largest folders so far").weak());
-        let width = ui.available_width().min(560.0);
+        let width = ui.available_width().min(720.0);
         // Steel, not rust: rust means "can be freed", and nothing has been judged yet.
         let (bar, track) = if ui.visuals().dark_mode {
             (Color32::from_rgb(0x5B, 0x6B, 0x78), Color32::from_rgb(0x2A, 0x33, 0x3B))
@@ -615,43 +615,57 @@ impl DeoxApp {
         ui.add_space(6.0);
     }
 
+    /// Left-aligned with fixed offsets, so switching between List and Map changes only what is below the header.
+    fn scan_screen(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.add(egui::Label::new(RichText::new(&self.scan_root).weak()).truncate());
+        ui.label(RichText::new(human(self.bytes_seen)).monospace().size(40.0));
+        ui.label(format!("{} files checked", self.files_seen));
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            step_ticks(ui, scan_step(&self.status));
+            ui.label(&self.status);
+        });
+        ui.add_space(6.0);
+        sweep(ui);
+        ui.add_space(6.0);
+        // Always one line tall, so the controls below stay put before the first folder is known.
+        let current = if self.scan_folder.is_empty() { " " } else { &self.scan_folder };
+        ui.add(egui::Label::new(RichText::new(current).weak().small()).truncate());
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.scan_view, View::List, "List");
+            ui.selectable_value(&mut self.scan_view, View::Map, "Map");
+        });
+        if self.scan_view == View::Map {
+            self.live_map_view(ui);
+        } else {
+            self.live_folder_list(ui);
+        }
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
+        if self.phase == Phase::Scanning {
+            self.scan_screen(ui);
+            return;
+        }
         if self.phase != Phase::Idle {
-            let mapping = self.phase == Phase::Scanning && self.scan_view == View::Map;
             ui.vertical_centered(|ui| {
-                ui.add_space(if mapping { 12.0 } else { 120.0 });
+                ui.add_space(120.0);
                 ui.spinner();
                 ui.add_space(8.0);
                 ui.label(&self.status);
-                if self.phase == Phase::Scanning {
-                    ui.label(RichText::new(&self.scan_root).weak());
-                    ui.label(format!("{} files checked so far ({})", self.files_seen, human(self.bytes_seen)));
-                    if !self.scan_folder.is_empty() {
-                        ui.add(egui::Label::new(RichText::new(&self.scan_folder).weak().small()).truncate());
-                    }
+                let (done, total) = self.move_progress;
+                if total > 0 {
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.scan_view, View::List, "List");
-                        ui.selectable_value(&mut self.scan_view, View::Map, "Map");
-                    });
-                    if mapping {
-                        self.live_map_view(ui);
-                    } else {
-                        self.live_folder_list(ui);
-                    }
-                } else {
-                    let (done, total) = self.move_progress;
-                    if total > 0 {
-                        ui.add_space(8.0);
-                        ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0));
-                        ui.label(format!("{done} of {total}"));
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Many small files take a few minutes. Please keep Deox open.").weak());
-                        ui.add_space(8.0);
-                        if ui.button("Stop after this batch").clicked() {
-                            self.move_cancel.cancel();
-                            self.status = "Stopping…".into();
-                        }
+                    ui.add(egui::ProgressBar::new(done as f32 / total as f32).desired_width(360.0));
+                    ui.label(format!("{done} of {total}"));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Many small files take a few minutes. Please keep Deox open.").weak());
+                    ui.add_space(8.0);
+                    if ui.button("Stop after this batch").clicked() {
+                        self.move_cancel.cancel();
+                        self.status = "Stopping…".into();
                     }
                 }
             });
@@ -699,6 +713,9 @@ impl DeoxApp {
                                     let fill = egui::Rect::from_min_size(bar.min, egui::vec2(width, bar.height()));
                                     ui.painter().rect_filled(fill, 2.0, colors.noninteractive.fg_stroke.color.gamma_multiply(0.6));
                                     ui.label(RichText::new(format!("{} used of {}", human(*used), human(*total))).weak());
+                                } else {
+                                    ui.add_space(6.0);
+                                    ui.add(egui::Label::new(RichText::new(root).monospace().small().weak()).truncate());
                                 }
                                 });
                             });
@@ -1709,9 +1726,59 @@ fn legend(ui: &mut egui::Ui) {
     }
 }
 
+/// The number from a "Step N of M: …" status line.
+fn scan_step(status: &str) -> Option<usize> {
+    status.strip_prefix("Step ")?.split(' ').next()?.parse().ok()
+}
+
+/// One tick per scan step: finished steps steel, the running one teal, the rest empty.
+fn step_ticks(ui: &mut egui::Ui, step: Option<usize>) {
+    const STEPS: usize = 4;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(STEPS as f32 * 18.0 - 4.0, 14.0), egui::Sense::hover());
+    let widgets = &ui.visuals().widgets;
+    let (done, running, todo) = (
+        widgets.noninteractive.fg_stroke.color.gamma_multiply(0.6),
+        ui.visuals().selection.stroke.color,
+        widgets.noninteractive.bg_stroke.color,
+    );
+    for n in 1..=STEPS {
+        let x = rect.left() + (n - 1) as f32 * 18.0;
+        let tick = egui::Rect::from_center_size(egui::pos2(x + 7.0, rect.center().y), egui::vec2(14.0, 4.0));
+        let color = match step {
+            Some(s) if n < s => done,
+            Some(s) if n == s => running,
+            _ => todo,
+        };
+        ui.painter().rect_filled(tick, 2.0, color);
+    }
+}
+
+/// A line with a teal segment travelling along it. It is the scan's only continuous motion, so a stalled window is visible.
+fn sweep(ui: &mut egui::Ui) {
+    const LENGTH: f64 = 0.22;
+    let (track, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
+    let head = (ui.input(|i| i.time) * 0.5) % (1.0 + LENGTH);
+    let at = |share: f64| track.left() + track.width() * share.clamp(0.0, 1.0) as f32;
+    let segment = egui::Rect::from_min_max(egui::pos2(at(head - LENGTH), track.top()), egui::pos2(at(head), track.bottom()));
+    ui.painter().rect_filled(track, 1.5, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    ui.painter().rect_filled(segment, 1.5, ui.visuals().selection.stroke.color);
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+}
+
 /// Case-insensitive match on a finding's path or rule name; an empty filter matches everything.
 fn matches_filter(finding: &Finding, needle: &str) -> bool {
     needle.is_empty()
         || finding.path.to_string_lossy().to_lowercase().contains(needle)
         || finding.rule.to_lowercase().contains(needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_step;
+
+    #[test]
+    fn reads_the_step_number() {
+        assert_eq!(scan_step("Step 2 of 4: applying cleanup rules…"), Some(2));
+        assert_eq!(scan_step("Cancelling…"), None);
+    }
 }

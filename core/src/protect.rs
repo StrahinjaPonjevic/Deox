@@ -21,6 +21,46 @@ struct Zones {
 const ELECTRON_APPS: [&str; 5] = ["Discord", "Slack", "Spotify", r"Microsoft\Teams", "Code"];
 const ELECTRON_CACHES: [&str; 3] = ["Cache", "Code Cache", "GPUCache"];
 
+/// Folder names in `%LOCALAPPDATA%` belonging to Windows, drivers, runtimes, or Deox itself.
+/// Never offered as orphaned app data even if no matching uninstall entry exists.
+const RESERVED_LOCAL_APPDATA: &[&str] = &[
+    "amd",
+    "application data",
+    "cef",
+    "comms",
+    "connecteddevicesplatform",
+    "crashdumps",
+    "d3dscache",
+    "deox",
+    "diagnostics",
+    "elevateddiagnostics",
+    "fontcache",
+    "intel",
+    "low",
+    "microsoft",
+    "nvidia",
+    "nvidia corporation",
+    "packages",
+    "peerdistrepub",
+    "placeholdertilelogofolder",
+    "programs",
+    "publishers",
+    "squirreltemp",
+    "temp",
+    "toastnotificationmanagercompat",
+    "virtualstore",
+];
+
+/// Returns `true` if `name` is a reserved `%LOCALAPPDATA%` folder (Windows/driver/runtime/Deox)
+/// or hidden/temporary (`.` or `~` prefix) that must never be offered as orphaned app data.
+pub fn is_reserved_appdata_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.is_empty()
+        || lower.starts_with('.')
+        || lower.starts_with('~')
+        || RESERVED_LOCAL_APPDATA.contains(&lower.as_str())
+}
+
 /// Returns `true` if the path must never be offered for deletion or deleted.
 pub fn is_protected(path: &Path) -> bool {
     let key = key_of(&resolve(path));
@@ -86,6 +126,11 @@ fn zones() -> &'static Zones {
         // Known folders may be redirected into OneDrive, so guard all of it.
         if let Some(onedrive) = env::var_os("OneDrive") {
             personal.push(key_of(Path::new(&onedrive)));
+        }
+        // Never offer or delete Deox's own local data folder (actions.log).
+        protected.push(key_of(&users.join(r"AppData\Local\Deox")));
+        if let Some(local) = env::var_os("LOCALAPPDATA") {
+            protected.push(key_of(&PathBuf::from(local).join("Deox")));
         }
 
         let mut allowed = vec![

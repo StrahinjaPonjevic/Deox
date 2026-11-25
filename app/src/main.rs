@@ -1103,6 +1103,7 @@ fn category_name(category: Category) -> &'static str {
         Category::DevArtifact => "Developer artifacts",
         Category::Duplicate => "Duplicate files",
         Category::OldLarge => "Old large files",
+        Category::OrphanedAppData => "Orphaned app data",
         Category::Bloatware => "Installed programs worth a look",
     }
 }

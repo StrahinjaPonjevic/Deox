@@ -3,6 +3,7 @@
 use deox_core::delete::{default_log_path, delete_with_progress, DeleteReport};
 use eframe::egui;
 use deox_core::dupes::find_duplicates;
+use deox_core::orphans::find_orphaned_appdata;
 use deox_core::programs::{installed_programs, AppxRegistry, BloatwareList, WindowsRegistry};
 use deox_core::report::Finding;
 use deox_core::rules::Rules;
@@ -136,6 +137,7 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
     notify.send(Msg::Status("Step 4 of 4: reading installed programs…".into()));
     let mut programs = installed_programs(&WindowsRegistry);
     programs.extend(installed_programs(&AppxRegistry));
+    findings.extend(find_orphaned_appdata(root, &index, &programs, &findings, SystemTime::now()));
     findings.extend(BloatwareList::builtin()?.evaluate(&programs));
 
     let tree = FolderTree::build(root, &index, &findings);

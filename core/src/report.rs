@@ -9,6 +9,7 @@ pub enum Category {
     DevArtifact,
     Duplicate,
     OldLarge,
+    OrphanedAppData,
     Bloatware,
 }
 

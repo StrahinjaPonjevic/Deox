@@ -1,4 +1,4 @@
-use deox_core::protect::{is_protected, is_skippable_dir};
+use deox_core::protect::{is_protected, is_reserved_appdata_dir, is_skippable_dir};
 use std::path::{Path, PathBuf};
 
 fn env(name: &str) -> PathBuf {
@@ -101,4 +101,14 @@ fn paths_are_normalized_before_the_check() {
     assert!(p(r"c:\WINDOWS\system32\X.DLL"));
     assert!(p(r"C:\Windows\.\System32"));
     assert!(p(r"C:\Windows\Temp\..\.."));
+}
+
+#[test]
+fn deox_data_and_reserved_appdata_dirs_are_guarded() {
+    let local = env("LOCALAPPDATA");
+    assert!(is_protected(&local.join(r"Deox\actions.log")));
+    for name in ["Microsoft", "Packages", "Programs", "Temp", "Deox", ".hidden", "~tmp"] {
+        assert!(is_reserved_appdata_dir(name), "{name}");
+    }
+    assert!(!is_reserved_appdata_dir("OldUninstalledApp"));
 }

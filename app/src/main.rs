@@ -123,6 +123,7 @@ struct DeoxApp {
     drive_space: Vec<(String, u64, u64)>,
     status: String,
     files_seen: u64,
+    bytes_seen: u64,
     /// Items settled and total while a move or check is running.
     move_progress: (usize, usize),
     move_cancel: Arc<Cancel>,
@@ -202,6 +203,7 @@ impl DeoxApp {
             drives,
             status: String::new(),
             files_seen: 0,
+            bytes_seen: 0,
             move_progress: (0, 0),
             move_cancel: Arc::new(Cancel::default()),
             filter: String::new(),
@@ -248,6 +250,7 @@ impl DeoxApp {
         self.cancel = Arc::new(Cancel::default());
         self.phase = Phase::Scanning;
         self.files_seen = 0;
+        self.bytes_seen = 0;
         self.scan_folder.clear();
         self.status = "Starting scan…".into();
         self.results = None;
@@ -303,7 +306,7 @@ impl DeoxApp {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Status(s) => self.status = s,
-            Msg::Progress(n) => self.files_seen = n,
+            Msg::Progress(n, bytes) => (self.files_seen, self.bytes_seen) = (n, bytes),
             Msg::Folder(folder) => self.scan_folder = folder,
             Msg::Moved(done, total) => self.move_progress = (done, total),
             Msg::Analysis(a) => {
@@ -446,7 +449,7 @@ impl DeoxApp {
                 ui.label(&self.status);
                 if self.phase == Phase::Scanning {
                     ui.label(RichText::new(&self.scan_root).weak());
-                    ui.label(format!("{} files checked so far", self.files_seen));
+                    ui.label(format!("{} files checked so far ({})", self.files_seen, human(self.bytes_seen)));
                     if !self.scan_folder.is_empty() {
                         ui.add(egui::Label::new(RichText::new(&self.scan_folder).weak().small()).truncate());
                     }

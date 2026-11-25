@@ -15,7 +15,7 @@ fn counts_files_and_sizes_exactly() {
     write(&dir.path().join("sub/b.txt"), 10);
     write(&dir.path().join("sub/deep/c.txt"), 0);
 
-    let index = scan(dir.path(), &Cancel::default(), |_| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
 
     assert_eq!(index.files.len(), 3);
     assert_eq!(index.files.iter().map(|f| f.size).sum::<u64>(), 13);
@@ -40,7 +40,7 @@ fn does_not_follow_junctions() {
         .status;
     assert!(status.success(), "junction could not be created");
 
-    let index = scan(&root, &Cancel::default(), |_| {});
+    let index = scan(&root, &Cancel::default(), |_, _| {});
 
     assert_eq!(index.files.len(), 1);
     assert!(index.files[0].path.ends_with("own.txt"));
@@ -71,7 +71,7 @@ fn inaccessible_folder_is_recorded_not_fatal() {
     write(&locked.join("hidden.txt"), 1);
     let _guard = Denied::new(&locked);
 
-    let index = scan(dir.path(), &Cancel::default(), |_| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
 
     assert_eq!(index.files.len(), 1);
     assert_eq!(index.errors.len(), 1);
@@ -82,7 +82,7 @@ fn inaccessible_folder_is_recorded_not_fatal() {
 fn missing_root_is_an_error_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
 
-    let index = scan(&dir.path().join("nope"), &Cancel::default(), |_| {});
+    let index = scan(&dir.path().join("nope"), &Cancel::default(), |_, _| {});
 
     assert!(index.files.is_empty());
     assert_eq!(index.errors.len(), 1);
@@ -96,7 +96,7 @@ fn cancel_stops_the_scan() {
     }
     let cancel = Cancel::default();
 
-    let index = scan(dir.path(), &cancel, |seen| {
+    let index = scan(dir.path(), &cancel, |seen, _| {
         if seen == 5 {
             cancel.cancel();
         }
@@ -114,23 +114,23 @@ fn skipped_folders_are_not_entered_but_the_root_is_always_scanned() {
     write(&dir.path().join("other/b.txt"), 1);
     let skip_named = |p: &Path| p.file_name().is_some_and(|n| n == "skipme");
 
-    let index = walk(dir.path(), &Cancel::default(), |_| {}, |_| {}, skip_named);
+    let index = walk(dir.path(), &Cancel::default(), |_, _| {}, |_| {}, skip_named);
     assert_eq!(index.files.len(), 2);
     assert!(index.files.iter().all(|f| !f.path.to_string_lossy().contains("skipme")));
 
-    let index = walk(&dir.path().join("skipme"), &Cancel::default(), |_| {}, |_| {}, skip_named);
+    let index = walk(&dir.path().join("skipme"), &Cancel::default(), |_, _| {}, |_| {}, skip_named);
     assert_eq!(index.files.len(), 1);
 }
 
 #[test]
-fn progress_reports_every_file() {
+fn progress_reports_every_file_and_its_size() {
     let dir = tempfile::tempdir().unwrap();
     for i in 0..4 {
-        write(&dir.path().join(format!("f{i}.txt")), 1);
+        write(&dir.path().join(format!("f{i}.txt")), 10);
     }
-    let mut last = 0;
+    let mut last = (0, 0);
 
-    scan(dir.path(), &Cancel::default(), |seen| last = seen);
+    scan(dir.path(), &Cancel::default(), |seen, bytes| last = (seen, bytes));
 
-    assert_eq!(last, 4);
+    assert_eq!(last, (4, 40));
 }

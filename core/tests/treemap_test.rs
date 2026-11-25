@@ -29,7 +29,7 @@ fn folder_sizes_add_up_through_the_tree() {
     write(&dir.path().join("a/one.bin"), 100);
     write(&dir.path().join("a/deep/two.bin"), 50);
     write(&dir.path().join("b/three.bin"), 20);
-    let index = scan(dir.path(), &Cancel::default(), |_| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
 
     let tree = FolderTree::build(dir.path(), &index, &[]);
 
@@ -47,7 +47,7 @@ fn findings_mark_the_folders_that_contain_them() {
     write(&dir.path().join("cache/x.bin"), 40);
     write(&dir.path().join("cache/y.bin"), 10);
     write(&dir.path().join("docs/z.bin"), 30);
-    let index = scan(dir.path(), &Cancel::default(), |_| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
     let findings = [
         finding(&dir.path().join("cache/x.bin"), 40, Confidence::Safe),
         finding(&dir.path().join("docs/z.bin"), 30, Confidence::Review),
@@ -66,7 +66,7 @@ fn findings_mark_the_folders_that_contain_them() {
 fn flagged_bytes_never_exceed_the_folder_size() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir.path().join("node_modules/pkg/a.bin"), 100);
-    let index = scan(dir.path(), &Cancel::default(), |_| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
     // A flagged folder and a duplicate inside it overlap.
     let findings = [
         finding(&dir.path().join("node_modules"), 100, Confidence::Review),
@@ -83,7 +83,7 @@ fn flagged_bytes_never_exceed_the_folder_size() {
 fn trail_runs_from_the_root_to_the_folder() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir.path().join("a/b/c.bin"), 1);
-    let index = scan(dir.path(), &Cancel::default(), |_| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
     let tree = FolderTree::build(dir.path(), &index, &[]);
 
     let deepest = *tree.node(*tree.node(*tree.node(FolderTree::ROOT).children.first().unwrap()).children.first().unwrap()).parent.as_ref().unwrap();

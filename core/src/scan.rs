@@ -42,8 +42,8 @@ pub struct Index {
 /// Walks `root` in parallel and indexes every regular file.
 /// Links and junctions are not entered. Unreadable entries are recorded in
 /// `Index::errors` and never abort the scan.
-/// `progress` receives the number of files indexed so far, once per file.
-pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64)) -> Index {
+/// `progress` receives the number of files indexed so far and their total size in bytes, once per file.
+pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64, u64)) -> Index {
     scan_with_folders(root, cancel, progress, |_| {})
 }
 
@@ -52,7 +52,7 @@ pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64)) -> Index {
 pub fn scan_with_folders(
     root: &Path,
     cancel: &Cancel,
-    progress: impl FnMut(u64),
+    progress: impl FnMut(u64, u64),
     on_folder: impl FnMut(&Path),
 ) -> Index {
     walk(root, cancel, progress, on_folder, is_skippable_dir)
@@ -63,11 +63,12 @@ pub fn scan_with_folders(
 pub fn walk(
     root: &Path,
     cancel: &Cancel,
-    mut progress: impl FnMut(u64),
+    mut progress: impl FnMut(u64, u64),
     mut on_folder: impl FnMut(&Path),
     skip: fn(&Path) -> bool,
 ) -> Index {
     let mut index = Index::default();
+    let mut bytes = 0u64;
     let walker = jwalk::WalkDir::new(root).process_read_dir(move |depth, _, _, children| {
         // `depth` is `None` for the pseudo listing that holds only the root itself.
         if depth.is_none() {
@@ -105,7 +106,8 @@ pub fn walk(
                     modified: meta.modified().ok(),
                     accessed: meta.accessed().ok(),
                 });
-                progress(index.files.len() as u64);
+                bytes += meta.len();
+                progress(index.files.len() as u64, bytes);
             }
             Err(e) => index.errors.push(ScanError { path: Some(entry.path()), message: e.to_string() }),
         }

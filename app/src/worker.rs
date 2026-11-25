@@ -29,7 +29,8 @@ pub struct Analysis {
 
 pub enum Msg {
     Status(String),
-    Progress(u64),
+    /// Files and bytes indexed so far.
+    Progress(u64, u64),
     /// The folder the scan is currently walking.
     Folder(String),
     /// Items settled so far and the total, while moving to the Recycle Bin.
@@ -100,9 +101,9 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
     let index = scan_with_folders(
         root,
         cancel,
-        |seen| {
+        |seen, bytes| {
             if seen.is_multiple_of(512) {
-                notify.send(Msg::Progress(seen));
+                notify.send(Msg::Progress(seen, bytes));
             }
         },
         |folder| {
@@ -120,7 +121,7 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
         return Ok(cancelled(Vec::new()));
     }
 
-    notify.send(Msg::Progress(files));
+    notify.send(Msg::Progress(files, index.files.iter().map(|f| f.size).sum()));
     notify.send(Msg::Status("Step 2 of 4: applying cleanup rules…".into()));
     let mut findings = Rules::builtin()?.evaluate(&index, SystemTime::now());
 

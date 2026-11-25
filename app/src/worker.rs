@@ -7,12 +7,17 @@ use deox_core::orphans::find_orphaned_appdata;
 use deox_core::programs::{installed_programs, AppxRegistry, BloatwareList, WindowsRegistry};
 use deox_core::report::Finding;
 use deox_core::rules::Rules;
-use deox_core::scan::{scan_with_folders, Cancel};
+use deox_core::scan::{first_level, scan_with_folders, Cancel};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use deox_core::treemap::FolderTree;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+/// How often the sizes of the folders under the scan root are sent to the window.
+const SUMS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How often the scan reports the folder it is in. Time-based, so the path updates steadily on any drive.
 const FOLDER_INTERVAL: Duration = Duration::from_millis(100);
@@ -34,6 +39,8 @@ pub enum Msg {
     Status(String),
     /// Files and bytes indexed so far.
     Progress(u64, u64),
+    /// Sizes so far of the folders directly under the scan root, largest first.
+    Folders(Vec<(String, u64)>),
     /// The folder the scan is currently walking.
     Folder(String),
     /// Items settled so far and the total, while moving to the Recycle Bin.
@@ -98,15 +105,37 @@ pub fn spawn_delete(findings: Vec<Finding>, dry_run: bool, cancel: Arc<Cancel>, 
     });
 }
 
+fn largest_first(sums: &HashMap<OsString, u64>) -> Vec<(String, u64)> {
+    let mut top: Vec<(String, u64)> =
+        sums.iter().map(|(name, size)| (name.to_string_lossy().into_owned(), *size)).collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top
+}
+
 fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow::Result<Analysis> {
     notify.send(Msg::Status("Step 1 of 4: scanning files…".into()));
     let mut last_folder_sent = Instant::now();
+    let mut last_sums_sent = Instant::now();
+    let mut sums: HashMap<OsString, u64> = HashMap::new();
     let index = scan_with_folders(
         root,
         cancel,
-        |seen, bytes| {
+        |seen, bytes, file| {
+            if let Some(name) = first_level(root, &file.path) {
+                // Looked up first: the folder is almost always known, and a key per file would be an allocation per file.
+                match sums.get_mut(name) {
+                    Some(total) => *total += file.size,
+                    None => {
+                        sums.insert(name.to_owned(), file.size);
+                    }
+                }
+            }
             if seen.is_multiple_of(512) {
                 notify.send(Msg::Progress(seen, bytes));
+            }
+            if last_sums_sent.elapsed() >= SUMS_INTERVAL {
+                last_sums_sent = Instant::now();
+                notify.send(Msg::Folders(largest_first(&sums)));
             }
         },
         |folder| {
@@ -125,6 +154,8 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, notify: &Notifier) -> anyhow
     }
 
     notify.send(Msg::Progress(files, index.files.iter().map(|f| f.size).sum()));
+    // The last timer tick may be up to a quarter of a second old, and the list stays on screen for the next steps.
+    notify.send(Msg::Folders(largest_first(&sums)));
     notify.send(Msg::Status("Step 2 of 4: applying cleanup rules…".into()));
     let mut findings = Rules::builtin()?.evaluate(&index, SystemTime::now());
 

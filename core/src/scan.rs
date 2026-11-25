@@ -39,11 +39,19 @@ pub struct Index {
     pub cancelled: bool,
 }
 
+/// The folder directly under `root` that holds `path`; `None` for files lying directly in `root`.
+pub fn first_level<'a>(root: &Path, path: &'a Path) -> Option<&'a std::ffi::OsStr> {
+    let mut parts = path.strip_prefix(root).ok()?.components();
+    let first = parts.next()?;
+    parts.next().map(|_| first.as_os_str())
+}
+
 /// Walks `root` in parallel and indexes every regular file.
 /// Links and junctions are not entered. Unreadable entries are recorded in
 /// `Index::errors` and never abort the scan.
-/// `progress` receives the number of files indexed so far and their total size in bytes, once per file.
-pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64, u64)) -> Index {
+/// `progress` receives the number of files indexed so far, their total size in bytes and the file just
+/// indexed, once per file.
+pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64, u64, &FileEntry)) -> Index {
     scan_with_folders(root, cancel, progress, |_| {})
 }
 
@@ -52,7 +60,7 @@ pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64, u64)) -> Ind
 pub fn scan_with_folders(
     root: &Path,
     cancel: &Cancel,
-    progress: impl FnMut(u64, u64),
+    progress: impl FnMut(u64, u64, &FileEntry),
     on_folder: impl FnMut(&Path),
 ) -> Index {
     walk(root, cancel, progress, on_folder, is_skippable_dir)
@@ -63,7 +71,7 @@ pub fn scan_with_folders(
 pub fn walk(
     root: &Path,
     cancel: &Cancel,
-    mut progress: impl FnMut(u64, u64),
+    mut progress: impl FnMut(u64, u64, &FileEntry),
     mut on_folder: impl FnMut(&Path),
     skip: fn(&Path) -> bool,
 ) -> Index {
@@ -107,7 +115,7 @@ pub fn walk(
                     accessed: meta.accessed().ok(),
                 });
                 bytes += meta.len();
-                progress(index.files.len() as u64, bytes);
+                progress(index.files.len() as u64, bytes, index.files.last().expect("just pushed"));
             }
             Err(e) => index.errors.push(ScanError { path: Some(entry.path()), message: e.to_string() }),
         }

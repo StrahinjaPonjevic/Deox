@@ -1,4 +1,4 @@
-use deox_core::scan::{scan, walk, Cancel};
+use deox_core::scan::{first_level, scan, walk, Cancel};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -15,7 +15,7 @@ fn counts_files_and_sizes_exactly() {
     write(&dir.path().join("sub/b.txt"), 10);
     write(&dir.path().join("sub/deep/c.txt"), 0);
 
-    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _| {});
 
     assert_eq!(index.files.len(), 3);
     assert_eq!(index.files.iter().map(|f| f.size).sum::<u64>(), 13);
@@ -40,7 +40,7 @@ fn does_not_follow_junctions() {
         .status;
     assert!(status.success(), "junction could not be created");
 
-    let index = scan(&root, &Cancel::default(), |_, _| {});
+    let index = scan(&root, &Cancel::default(), |_, _, _| {});
 
     assert_eq!(index.files.len(), 1);
     assert!(index.files[0].path.ends_with("own.txt"));
@@ -71,7 +71,7 @@ fn inaccessible_folder_is_recorded_not_fatal() {
     write(&locked.join("hidden.txt"), 1);
     let _guard = Denied::new(&locked);
 
-    let index = scan(dir.path(), &Cancel::default(), |_, _| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _| {});
 
     assert_eq!(index.files.len(), 1);
     assert_eq!(index.errors.len(), 1);
@@ -82,7 +82,7 @@ fn inaccessible_folder_is_recorded_not_fatal() {
 fn missing_root_is_an_error_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
 
-    let index = scan(&dir.path().join("nope"), &Cancel::default(), |_, _| {});
+    let index = scan(&dir.path().join("nope"), &Cancel::default(), |_, _, _| {});
 
     assert!(index.files.is_empty());
     assert_eq!(index.errors.len(), 1);
@@ -96,7 +96,7 @@ fn cancel_stops_the_scan() {
     }
     let cancel = Cancel::default();
 
-    let index = scan(dir.path(), &cancel, |seen, _| {
+    let index = scan(dir.path(), &cancel, |seen, _, _| {
         if seen == 5 {
             cancel.cancel();
         }
@@ -114,11 +114,11 @@ fn skipped_folders_are_not_entered_but_the_root_is_always_scanned() {
     write(&dir.path().join("other/b.txt"), 1);
     let skip_named = |p: &Path| p.file_name().is_some_and(|n| n == "skipme");
 
-    let index = walk(dir.path(), &Cancel::default(), |_, _| {}, |_| {}, skip_named);
+    let index = walk(dir.path(), &Cancel::default(), |_, _, _| {}, |_| {}, skip_named);
     assert_eq!(index.files.len(), 2);
     assert!(index.files.iter().all(|f| !f.path.to_string_lossy().contains("skipme")));
 
-    let index = walk(&dir.path().join("skipme"), &Cancel::default(), |_, _| {}, |_| {}, skip_named);
+    let index = walk(&dir.path().join("skipme"), &Cancel::default(), |_, _, _| {}, |_| {}, skip_named);
     assert_eq!(index.files.len(), 1);
 }
 
@@ -130,7 +130,25 @@ fn progress_reports_every_file_and_its_size() {
     }
     let mut last = (0, 0);
 
-    scan(dir.path(), &Cancel::default(), |seen, bytes| last = (seen, bytes));
+    scan(dir.path(), &Cancel::default(), |seen, bytes, _| last = (seen, bytes));
 
     assert_eq!(last, (4, 40));
+}
+
+#[test]
+fn progress_files_add_up_per_first_level_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("a/x.txt"), 10);
+    write(&dir.path().join("a/deep/y.txt"), 5);
+    write(&dir.path().join("b/z.txt"), 7);
+    write(&dir.path().join("loose.txt"), 100);
+    let mut sums = std::collections::BTreeMap::new();
+
+    scan(dir.path(), &Cancel::default(), |_, _, file| {
+        if let Some(name) = first_level(dir.path(), &file.path) {
+            *sums.entry(name.to_string_lossy().into_owned()).or_insert(0u64) += file.size;
+        }
+    });
+
+    assert_eq!(sums.into_iter().collect::<Vec<_>>(), vec![("a".to_string(), 15), ("b".to_string(), 7)]);
 }

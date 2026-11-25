@@ -12,6 +12,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use worker::{Msg, Notifier};
 
 fn main() -> eframe::Result {
@@ -124,6 +125,9 @@ struct DeoxApp {
     status: String,
     files_seen: u64,
     bytes_seen: u64,
+    /// Largest folders under the scan root so far, in display order (see `merge_live_folders`).
+    live_folders: Vec<(String, u64)>,
+    live_reordered: Instant,
     /// Items settled and total while a move or check is running.
     move_progress: (usize, usize),
     move_cancel: Arc<Cancel>,
@@ -204,6 +208,8 @@ impl DeoxApp {
             status: String::new(),
             files_seen: 0,
             bytes_seen: 0,
+            live_folders: Vec::new(),
+            live_reordered: Instant::now(),
             move_progress: (0, 0),
             move_cancel: Arc::new(Cancel::default()),
             filter: String::new(),
@@ -251,6 +257,7 @@ impl DeoxApp {
         self.phase = Phase::Scanning;
         self.files_seen = 0;
         self.bytes_seen = 0;
+        self.live_folders.clear();
         self.scan_folder.clear();
         self.status = "Starting scan…".into();
         self.results = None;
@@ -303,10 +310,76 @@ impl DeoxApp {
         self.cursor_row = self.cursor_row.filter(|c| *c < self.rows.len());
     }
 
+    /// Takes new sizes (largest first, every folder seen so far) into the live list without making rows
+    /// jump: known rows keep their place unless one is overtaken by more than 5%, at most once a second.
+    /// A folder seen for the first time takes its place at once.
+    fn merge_live_folders(&mut self, folders: Vec<(String, u64)>) {
+        let grew = folders.len() > self.live_folders.len();
+        if !grew {
+            let sizes: HashMap<&str, u64> = folders.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+            for (name, size) in &mut self.live_folders {
+                *size = sizes.get(name.as_str()).copied().unwrap_or(*size);
+            }
+        }
+        let overtaken = self.live_folders.windows(2).any(|w| w[1].1 as f64 > w[0].1 as f64 * 1.05);
+        if grew || overtaken && self.live_reordered.elapsed() >= Duration::from_secs(1) {
+            self.live_folders = folders;
+            self.live_reordered = Instant::now();
+        }
+    }
+
+    fn live_folder_list(&self, ui: &mut egui::Ui) {
+        const SHOWN: usize = 8;
+        let Some(largest) = self.live_folders.iter().map(|f| f.1).max().filter(|m| *m > 0) else { return };
+        ui.add_space(12.0);
+        ui.label(RichText::new("Largest folders so far").weak());
+        let width = ui.available_width().min(560.0);
+        // Steel, not rust: rust means "can be freed", and nothing has been judged yet.
+        let (bar, track) = if ui.visuals().dark_mode {
+            (Color32::from_rgb(0x5B, 0x6B, 0x78), Color32::from_rgb(0x2A, 0x33, 0x3B))
+        } else {
+            (Color32::from_rgb(0x87, 0x95, 0xA1), Color32::from_rgb(0xD2, 0xD9, 0xDE))
+        };
+        let text = ui.visuals().text_color();
+        for (name, size) in self.live_folders.iter().take(SHOWN) {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+            let name_w = 150.0;
+            let size_w = 80.0;
+            let track_rect = egui::Rect::from_min_max(
+                rect.left_top() + egui::vec2(name_w, 5.0),
+                rect.right_bottom() - egui::vec2(size_w, 5.0),
+            );
+            // Keyed by folder, so a row that moves keeps its own bar width instead of inheriting its neighbour's.
+            let share = ui.ctx().animate_value_with_time(egui::Id::unique(("live_folder", name)), *size as f32 / largest as f32, 0.3);
+            let fill = egui::Rect::from_min_size(track_rect.min, egui::vec2(track_rect.width() * share, track_rect.height()));
+            let painter = ui.painter();
+            painter.rect_filled(track_rect, 2.0, track);
+            painter.rect_filled(fill, 2.0, bar);
+            let name_font = egui::TextStyle::Body.resolve(ui.style());
+            // One line, cut at the bar: a long name must not wrap into the rows around it.
+            let shown = painter.layout_no_wrap(name.clone(), name_font, text);
+            let name_clip = egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + name_w - 8.0, rect.bottom()));
+            painter
+                .with_clip_rect(name_clip)
+                .galley(egui::pos2(rect.left(), rect.center().y - shown.size().y / 2.0), shown, text);
+            painter.text(
+                egui::pos2(rect.right(), rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                human(*size),
+                egui::TextStyle::Monospace.resolve(ui.style()),
+                text,
+            );
+        }
+        if self.live_folders.len() > SHOWN {
+            ui.label(RichText::new(format!("+ {} smaller", self.live_folders.len() - SHOWN)).weak());
+        }
+    }
+
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Status(s) => self.status = s,
             Msg::Progress(n, bytes) => (self.files_seen, self.bytes_seen) = (n, bytes),
+            Msg::Folders(folders) => self.merge_live_folders(folders),
             Msg::Folder(folder) => self.scan_folder = folder,
             Msg::Moved(done, total) => self.move_progress = (done, total),
             Msg::Analysis(a) => {
@@ -453,8 +526,7 @@ impl DeoxApp {
                     if !self.scan_folder.is_empty() {
                         ui.add(egui::Label::new(RichText::new(&self.scan_folder).weak().small()).truncate());
                     }
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Large drives can take several minutes. You can cancel at any time.").weak());
+                    self.live_folder_list(ui);
                 } else {
                     let (done, total) = self.move_progress;
                     if total > 0 {

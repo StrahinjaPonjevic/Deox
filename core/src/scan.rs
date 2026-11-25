@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
+use crate::protect::is_skippable_dir;
+
 /// Cooperative cancellation flag, safe to share between threads.
 #[derive(Default)]
 pub struct Cancel(AtomicBool);
@@ -46,14 +48,34 @@ pub fn scan(root: &Path, cancel: &Cancel, progress: impl FnMut(u64)) -> Index {
 }
 
 /// Like [`scan`], and also calls `on_folder` with every folder the walk enters.
+/// Protected folders that cannot yield findings are not entered (see [`is_skippable_dir`]).
 pub fn scan_with_folders(
+    root: &Path,
+    cancel: &Cancel,
+    progress: impl FnMut(u64),
+    on_folder: impl FnMut(&Path),
+) -> Index {
+    walk(root, cancel, progress, on_folder, is_skippable_dir)
+}
+
+/// The walk behind [`scan_with_folders`], with the folder-skipping rule passed in.
+/// The root itself is never skipped, only folders below it.
+pub fn walk(
     root: &Path,
     cancel: &Cancel,
     mut progress: impl FnMut(u64),
     mut on_folder: impl FnMut(&Path),
+    skip: fn(&Path) -> bool,
 ) -> Index {
     let mut index = Index::default();
-    for entry in jwalk::WalkDir::new(root) {
+    let walker = jwalk::WalkDir::new(root).process_read_dir(move |depth, _, _, children| {
+        // `depth` is `None` for the pseudo listing that holds only the root itself.
+        if depth.is_none() {
+            return;
+        }
+        children.retain(|c| !c.as_ref().is_ok_and(|e| e.file_type().is_dir() && skip(&e.path())));
+    });
+    for entry in walker {
         if cancel.is_cancelled() {
             index.cancelled = true;
             break;

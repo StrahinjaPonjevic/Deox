@@ -1,4 +1,4 @@
-use deox_core::protect::is_protected;
+use deox_core::protect::{is_protected, is_skippable_dir};
 use std::path::{Path, PathBuf};
 
 fn env(name: &str) -> PathBuf {
@@ -49,6 +49,39 @@ fn allowlisted_cache_dirs_expose_only_their_contents() {
     assert!(p(r"C:\Windows\Temp"));
     assert!(p(r"C:\Windows\SoftwareDistribution"));
     assert!(p(r"C:\Windows\SoftwareDistribution\DataStore\x.edb"));
+}
+
+#[test]
+fn scan_skips_protected_dirs_without_allowed_caches_or_personal_files() {
+    let roaming = env("APPDATA");
+    let home = env("USERPROFILE");
+    for dir in [
+        PathBuf::from(r"C:\Windows\System32"),
+        PathBuf::from(r"C:\Program Files\App"),
+        PathBuf::from(r"C:\ProgramData\Vendor"),
+        roaming.join("SomeGame"),
+        roaming.join(r"Discord\Local Storage"),
+        home.join(".ssh"),
+    ] {
+        assert!(is_skippable_dir(&dir), "{dir:?}");
+    }
+    for dir in [
+        PathBuf::from(r"C:\Windows"),
+        PathBuf::from(r"C:\Windows\Temp"),
+        PathBuf::from(r"C:\Windows\SoftwareDistribution"),
+        roaming.clone(),
+        roaming.join("Discord"),
+        roaming.join(r"Discord\Cache"),
+        roaming.join(r"Discord\Cache\Cache_Data"),
+        roaming.join(r"Code\Code Cache\js"),
+        PathBuf::from(r"C:\Windows\Temp\sub"),
+        PathBuf::from(r"C:\Windows\SoftwareDistribution\Download\a\b"),
+        home.join("Documents"),
+        home.join(r"Pictures\Trip"),
+        std::env::temp_dir().join("work"),
+    ] {
+        assert!(!is_skippable_dir(&dir), "{dir:?}");
+    }
 }
 
 #[test]

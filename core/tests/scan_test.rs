@@ -1,4 +1,4 @@
-use deox_core::scan::{scan, Cancel};
+use deox_core::scan::{scan, walk, Cancel};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -104,6 +104,22 @@ fn cancel_stops_the_scan() {
 
     assert!(index.cancelled);
     assert!(index.files.len() < 200);
+}
+
+#[test]
+fn skipped_folders_are_not_entered_but_the_root_is_always_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("keep.txt"), 1);
+    write(&dir.path().join("skipme/inner/a.txt"), 1);
+    write(&dir.path().join("other/b.txt"), 1);
+    let skip_named = |p: &Path| p.file_name().is_some_and(|n| n == "skipme");
+
+    let index = walk(dir.path(), &Cancel::default(), |_| {}, |_| {}, skip_named);
+    assert_eq!(index.files.len(), 2);
+    assert!(index.files.iter().all(|f| !f.path.to_string_lossy().contains("skipme")));
+
+    let index = walk(&dir.path().join("skipme"), &Cancel::default(), |_| {}, |_| {}, skip_named);
+    assert_eq!(index.files.len(), 1);
 }
 
 #[test]

@@ -11,6 +11,8 @@ type Key = Vec<String>;
 
 struct Zones {
     protected: Vec<Key>,
+    /// Protected folders of the user's own files; scans still enter them so duplicates show.
+    personal: Vec<Key>,
     /// Directories inside a protected zone whose *contents* may be offered.
     allowed: Vec<Key>,
 }
@@ -31,7 +33,22 @@ pub fn is_protected(path: &Path) -> bool {
     if zones.allowed.iter().any(|a| key.len() > a.len() && starts_with(&key, a)) {
         return false;
     }
+    zones.protected.iter().chain(&zones.personal).any(|z| starts_with(&key, z))
+}
+
+/// Returns `true` if a scan can skip this directory: it is protected, holds no personal
+/// files whose duplicates are shown, and has no allowed cache below it.
+/// Cheaper than [`is_protected`] (no canonicalization) and errs towards `false`.
+pub fn is_skippable_dir(path: &Path) -> bool {
+    let key = key_of(path);
+    if key.len() <= 2 {
+        return false;
+    }
+    let zones = zones();
     zones.protected.iter().any(|z| starts_with(&key, z))
+        && !zones.personal.iter().any(|z| starts_with(&key, z))
+        // Related to an allowed zone, as a parent or as a subfolder; `*` matches one component.
+        && !zones.allowed.iter().any(|a| a.iter().zip(&key).all(|(z, k)| z == "*" || z == k))
 }
 
 fn starts_with(key: &[String], zone: &[String]) -> bool {
@@ -58,8 +75,9 @@ fn zones() -> &'static Zones {
             key_of(&var("ProgramData", r"C:\ProgramData")),
             key_of(&users.join(r"AppData\Roaming")),
         ];
+        let mut personal = Vec::new();
         for dir in ["Documents", "Pictures", "Desktop", "Videos"] {
-            protected.push(key_of(&users.join(dir)));
+            personal.push(key_of(&users.join(dir)));
         }
         // Credentials and the registry hive in the profile are never cleanup material.
         for item in [".ssh", ".gnupg", ".aws", "NTUSER.DAT"] {
@@ -67,7 +85,7 @@ fn zones() -> &'static Zones {
         }
         // Known folders may be redirected into OneDrive, so guard all of it.
         if let Some(onedrive) = env::var_os("OneDrive") {
-            protected.push(key_of(Path::new(&onedrive)));
+            personal.push(key_of(Path::new(&onedrive)));
         }
 
         let mut allowed = vec![
@@ -81,7 +99,7 @@ fn zones() -> &'static Zones {
                 allowed.push(key_of(&roaming.join(app).join(cache)));
             }
         }
-        Zones { protected, allowed }
+        Zones { protected, personal, allowed }
     })
 }
 

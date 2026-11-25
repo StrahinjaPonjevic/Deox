@@ -557,7 +557,7 @@ impl DeoxApp {
 
         let (removable_count, removable_size) = removable(&results.report);
         if removable_count == 0 {
-            ui.label(format!("Scanned {} files.", results.files));
+            ui.label(format!("Scanned {} files. System folders such as Windows and Program Files are skipped.", results.files));
             ui.add_space(8.0);
             ui.label("Nothing to clean up here. Try another folder or a whole drive.");
         } else {

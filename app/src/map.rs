@@ -133,14 +133,8 @@ pub(crate) fn live_map_view(ui: &mut egui::Ui, live: Option<&Arc<Mutex<LiveTree>
     let Some(snapshot) = &map.snapshot else { return };
     let mut open = None;
     ui.horizontal_wrapped(|ui| {
-        for (n, (id, name)) in snapshot.trail.iter().enumerate() {
-            if n > 0 {
-                ui.label("›");
-            }
-            if ui.selectable_label(n + 1 == snapshot.trail.len(), name).clicked() {
-                open = Some(*id);
-            }
-        }
+        let current = snapshot.trail.last().map_or(FolderTree::ROOT, |t| t.0);
+        open = trail_bar(ui, &snapshot.trail, current);
     });
     ui.label(RichText::new(format!("{} so far. Sizes are still growing.", human(snapshot.size))).weak());
     ui.add_space(4.0);
@@ -325,6 +319,32 @@ fn cell_title(tree: &FolderTree, kind: CellKind) -> String {
     }
 }
 
+/// Draws the breadcrumb segments, shortening the scan root to its folder name with the full path on hover.
+fn trail_bar(ui: &mut egui::Ui, trail: &[(usize, String)], current: usize) -> Option<usize> {
+    let mut open = None;
+    for (n, (id, full)) in trail.iter().enumerate() {
+        if n > 0 {
+            ui.label("›");
+        }
+        let short = if n == 0 {
+            std::path::Path::new(full)
+                .file_name()
+                .map_or_else(|| full.clone(), |name| name.to_string_lossy().into_owned())
+        } else {
+            full.clone()
+        };
+        let response = ui.selectable_label(*id == current, &short);
+        let clicked = response.clicked();
+        if short != *full {
+            response.on_hover_text(full);
+        }
+        if clicked {
+            open = Some(*id);
+        }
+    }
+    open
+}
+
 /// Draws the current folder as a nested treemap: every folder holds its subfolders and files, and every
 /// file big enough to see is a rectangle of its own. A click on a rectangle opens the folder it belongs to
 /// and points out the rectangle; the bar under the map says what it is and what can be done with it.
@@ -364,14 +384,13 @@ pub(crate) fn map_view(
             }
         }
         ui.add_space(6.0);
-        for (n, id) in trail.iter().copied().enumerate() {
-            if n > 0 {
-                ui.label("›");
-            }
-            let name = if n == 0 { tree.path(id).display().to_string() } else { tree.node(id).name.clone() };
-            if ui.selectable_label(id == folder, name).clicked() {
-                state.open(id, now, None);
-            }
+        let items: Vec<(usize, String)> = trail
+            .iter()
+            .copied()
+            .map(|id| (id, if id == FolderTree::ROOT { tree.path(id).display().to_string() } else { tree.node(id).name.clone() }))
+            .collect();
+        if let Some(target) = trail_bar(ui, &items, folder) {
+            state.open(target, now, None);
         }
     });
     let node = tree.node(folder);

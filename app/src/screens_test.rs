@@ -243,6 +243,106 @@ fn a_long_folder_name_does_not_push_the_size_out_of_the_map_panel() {
 }
 
 #[test]
+fn long_root_breadcrumb_stays_on_one_line() {
+    let _gpu = gpu();
+    let mut short = results_harness(WIDE);
+    short.run();
+    let baseline_y = short.get_by_label("in this folder").rect().min.y;
+
+    let deep = r"AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage\Deeply Nested Folder Name";
+    let root = format!(r"C:\Users\Some Person\{deep}\{deep}");
+    let Demo { findings, tree, files } = demo_at(Path::new(&root));
+    let mut long = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(tree)));
+    long.run();
+    assert!(
+        (long.get_by_label("in this folder").rect().min.y - baseline_y).abs() < 1.0,
+        "a long root path should truncate instead of wrapping the breadcrumb"
+    );
+
+    long.get_by_label("Chrome").click();
+    long.step();
+    long.get_by_label("Chrome").click();
+    long.run();
+    assert!(
+        (long.get_by_label("in this folder").rect().min.y - baseline_y).abs() < 1.0,
+        "drilling into a subfolder keeps the breadcrumb on one line"
+    );
+}
+
+#[test]
+fn deep_breadcrumb_does_not_widen_the_map_panel() {
+    let _gpu = gpu();
+    let root = Path::new(r"C:\Demo");
+    let deep_rel = Path::new("level1/level2/level3/level4/level5/level6/level7/level8/level9");
+    let deep_dir = root.join(deep_rel);
+    let index = Index {
+        files: vec![FileEntry { path: deep_dir.join("deep.bin"), size: 4_000_000, modified: None, accessed: None }],
+        ..Default::default()
+    };
+    let findings = vec![finding(&deep_dir, 4_000_000, Category::AppCache, Confidence::Safe)];
+    let tree = FolderTree::build(root, &index, &findings);
+    let (deep_id, _) = tree.locate(&deep_dir);
+    let mut h = harness(WIDE, move |app| app.set_results(findings, 1, 0, Some(tree)));
+    h.run();
+    let baseline_filter_x = h.get_by_label("Filter:").rect().min.x;
+
+    h.state_mut().map.open(deep_id, 0.0, None);
+    h.run();
+
+    let filter_x = h.get_by_label("Filter:").rect().min.x;
+    assert!((filter_x - baseline_filter_x).abs() < 1.0, "Filter moved from {baseline_filter_x} to {filter_x}");
+    let last_crumb = h
+        .query_all_by_label("level9")
+        .min_by_key(|n| n.rect().min.y as i32)
+        .expect("level9 breadcrumb")
+        .rect();
+    assert!(last_crumb.max.x < filter_x, "last breadcrumb {last_crumb:?} stays inside map panel (< {filter_x})");
+}
+
+#[test]
+fn ctrl_a_selects_only_visible_removable_items() {
+    let _gpu = gpu();
+    let Demo { mut findings, tree, files } = demo();
+    findings.push(Finding {
+        path: PathBuf::new(),
+        size: 1_000_000,
+        modified: None,
+        category: Category::Bloatware,
+        confidence: Confidence::Info,
+        rule: "Cache Cleaner App".into(),
+        reason: "Installed program".into(),
+        uninstall: Some("ms-settings:appsfeatures".into()),
+    });
+    let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(tree)));
+    h.run();
+    h.get_by_label("Clear").click();
+    h.run();
+    assert!(h.state().selected.is_empty());
+
+    // Matches both Cache/Chrome (Safe) and "Cache Cleaner App" (Info), while hiding Temp, node_modules, d39.bin.
+    h.state_mut().filter = "Cache".into();
+    h.state_mut().rebuild_rows();
+    h.run();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run();
+
+    let state = h.state();
+    let report = &state.results.as_ref().unwrap().report;
+    assert_eq!(state.selected.len(), 1);
+    let chosen = &report.findings[*state.selected.iter().next().unwrap()];
+    assert!(chosen.path.ends_with("Chrome"));
+    assert_ne!(chosen.confidence, Confidence::Info);
+
+    // Group checkbox toggles visible items in that category.
+    h.get_by_label("Select all in Application caches").click();
+    h.run();
+    assert!(h.state().selected.is_empty(), "toggling Application caches off clears Chrome");
+    h.get_by_label("Select all in Application caches").click();
+    h.run();
+    assert_eq!(h.state().selected.len(), 1);
+}
+
+#[test]
 fn results_without_a_map_still_show_the_list() {
     let _gpu = gpu();
     let Demo { findings, files, .. } = demo();

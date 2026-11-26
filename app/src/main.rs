@@ -87,7 +87,7 @@ struct DeoxApp {
     status: String,
     files_seen: u64,
     bytes_seen: u64,
-    /// Largest folders under the scan root so far, in display order (see `merge_live_folders`).
+    /// Largest folders under the scan root so far, in display order (see `map::stable_order`).
     live_folders: Vec<(String, u64)>,
     live_reordered: Instant,
     /// The scan's folder tree as it grows, shared with the worker that fills it.
@@ -286,13 +286,6 @@ impl DeoxApp {
         self.cursor_row = self.cursor_row.filter(|c| *c < self.rows.len());
     }
 
-    /// Takes new sizes (largest first, every folder seen so far) into the live list without making rows
-    /// jump: known rows keep their place unless one is overtaken by more than 5%, at most once a second.
-    /// A folder seen for the first time takes its place at once.
-    fn merge_live_folders(&mut self, folders: Vec<(String, u64)>) {
-        map::stable_order(&mut self.live_folders, folders, &mut self.live_reordered);
-    }
-
     fn live_folder_list(&self, ui: &mut egui::Ui) {
         const SHOWN: usize = 8;
         let Some(largest) = self.live_folders.iter().map(|f| f.1).max().filter(|m| *m > 0) else { return };
@@ -344,7 +337,7 @@ impl DeoxApp {
         match msg {
             Msg::Status(s) => self.status = s,
             Msg::Progress(n, bytes) => (self.files_seen, self.bytes_seen) = (n, bytes),
-            Msg::Folders(folders) => self.merge_live_folders(folders),
+            Msg::Folders(folders) => map::stable_order(&mut self.live_folders, folders, &mut self.live_reordered),
             Msg::Folder(folder) => self.scan_folder = folder,
             Msg::Moved(done, total) => self.move_progress = (done, total),
             Msg::Analysis(a) => {
@@ -503,13 +496,24 @@ impl DeoxApp {
     }
 
     fn start_screen(&mut self, ui: &mut egui::Ui) {
-        let mut places: Vec<(String, String, String, Option<(u64, u64)>)> = Vec::new();
+        struct Place {
+            title: String,
+            caption: &'static str,
+            root: String,
+            space: Option<(u64, u64)>,
+        }
+        let mut places = Vec::new();
         if let Some(home) = std::env::var_os("USERPROFILE").filter(|h| PathBuf::from(h).is_dir()) {
             let home = PathBuf::from(home).display().to_string();
-            places.push(("Your user folder".into(), "A good place to start".into(), home, None));
+            places.push(Place { title: "Your user folder".into(), caption: "A good place to start", root: home, space: None });
         }
         for (root, total, free) in &self.drive_space {
-            places.push((root.trim_end_matches('\\').into(), "Whole drive".into(), root.clone(), Some((total.saturating_sub(*free), *total))));
+            places.push(Place {
+                title: root.trim_end_matches('\\').into(),
+                caption: "Whole drive",
+                root: root.clone(),
+                space: Some((total.saturating_sub(*free), *total)),
+            });
         }
         let mut chosen = None;
         let top = ((ui.available_height() - 400.0) / 2.0).max(24.0);
@@ -527,14 +531,14 @@ impl DeoxApp {
                 ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
                 let card_width = ((column - 16.0) / 2.0).floor();
                 ui.horizontal_wrapped(|ui| {
-                    for (title, caption, root, space) in &places {
+                    for Place { title, caption, root, space } in &places {
                         let frame = egui::Frame::group(ui.style()).inner_margin(14.0).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
                             ui.set_width(card_width - 30.0);
                             ui.set_min_height(86.0);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 4.0;
                                 ui.label(RichText::new(title).size(22.0));
-                                ui.label(RichText::new(caption).weak());
+                                ui.label(RichText::new(*caption).weak());
                                 if let Some((used, total)) = space {
                                     ui.add_space(6.0);
                                     let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
@@ -684,7 +688,6 @@ impl DeoxApp {
     }
 
     fn results_list(&mut self, ui: &mut egui::Ui, removable_size: u64) {
-        let Some(results) = &self.results else { return };
         ui.add_space(4.0);
 
         let mut filter_changed = false;
@@ -711,54 +714,8 @@ impl DeoxApp {
 
         let row_height = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y) + ui.spacing().item_spacing.y;
         let row_pitch = row_height + ui.spacing().item_spacing.y;
-        let mut key_action: Option<usize> = None;
-        let mut key_enter = false;
-        if !self.modal_open() {
-            if let Some(id) = ui.memory(|m| m.focused()) {
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    ui.memory_mut(|m| m.surrender_focus(id));
-                }
-            } else if !ui.ctx().egui_wants_keyboard_input() && !self.rows.is_empty() {
-                let none = egui::Modifiers::NONE;
-                let (down, up, home, end, space, enter) = ui.input_mut(|i| {
-                    (
-                        i.consume_key(none, egui::Key::ArrowDown),
-                        i.consume_key(none, egui::Key::ArrowUp),
-                        i.consume_key(none, egui::Key::Home),
-                        i.consume_key(none, egui::Key::End),
-                        i.consume_key(none, egui::Key::Space),
-                        i.consume_key(none, egui::Key::Enter),
-                    )
-                });
-                let last = self.rows.len() - 1;
-                let current = self.cursor_row;
-                let moved_to = if down {
-                    Some(current.map_or(0, |c| (c + 1).min(last)))
-                } else if up {
-                    Some(current.map_or(0, |c| c.saturating_sub(1)))
-                } else if home {
-                    Some(0)
-                } else if end {
-                    Some(last)
-                } else {
-                    None
-                };
-                if let Some(target) = moved_to {
-                    self.cursor_row = Some(target);
-                    let (offset, height) = self.scroll_state;
-                    let top = target as f32 * row_pitch;
-                    if top < offset {
-                        self.scroll_to = Some(top);
-                    } else if top + row_pitch > offset + height {
-                        self.scroll_to = Some(top + row_pitch - height);
-                    }
-                }
-                if (space || enter) && current.is_some() {
-                    key_action = current;
-                    key_enter = enter;
-                }
-            }
-        }
+        let (key_action, key_enter) = self.list_keys(ui, row_pitch);
+        let Some(results) = &self.results else { return };
         let cursor = self.cursor_row;
         let dark = ui.visuals().dark_mode;
         let mut toggled = None;
@@ -776,18 +733,13 @@ impl DeoxApp {
                 let row_top = ui.cursor().min.y;
                 match row {
                     Row::Header { category, total, count } => {
-                        let (chosen, selectable) = results
-                            .report
-                            .findings
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, f)| f.category == *category && f.confidence != Confidence::Info && self.visible[*i])
-                            .fold((0, 0), |(c, t), (i, _)| (c + usize::from(self.selected.contains(&i)), t + 1));
+                        let (chosen, total_selectable) = selectable(&results.report, &self.visible, Some(*category))
+                            .fold((0, 0), |(c, t), i| (c + usize::from(self.selected.contains(&i)), t + 1));
                         ui.horizontal(|ui| {
                             ui.set_min_height(row_height);
-                            if selectable > 0 {
-                                let mut on = chosen == selectable;
-                                let partial = chosen > 0 && chosen < selectable;
+                            if total_selectable > 0 {
+                                let mut on = chosen == total_selectable;
+                                let partial = chosen > 0 && chosen < total_selectable;
                                 let check = ui.add(egui::Checkbox::new(&mut on, "").indeterminate(partial));
                                 name_checkbox(&check, on, &format!("Select all in {}", category_name(*category)));
                                 if check.changed() {
@@ -805,7 +757,7 @@ impl DeoxApp {
                             }
                             ui.label(RichText::new(items(*count)).weak());
                             ui.label(RichText::new(human(*total)).monospace());
-                            if selectable > 0 {
+                            if total_selectable > 0 {
                                 share_bar(ui, *total, removable_size.max(1));
                             }
                         });
@@ -896,15 +848,10 @@ impl DeoxApp {
                     if key_enter {
                         toggled = Some(*category);
                     } else {
-                        let (chosen, selectable) = results
-                            .report
-                            .findings
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, f)| f.category == *category && f.confidence != Confidence::Info && self.visible[*i])
-                            .fold((0, 0), |(c, t), (i, _)| (c + usize::from(self.selected.contains(&i)), t + 1));
-                        if selectable > 0 {
-                            category_select = Some((*category, chosen < selectable));
+                        let (chosen, total) = selectable(&results.report, &self.visible, Some(*category))
+                            .fold((0, 0), |(c, t), i| (c + usize::from(self.selected.contains(&i)), t + 1));
+                        if total > 0 {
+                            category_select = Some((*category, chosen < total));
                         }
                     }
                 }
@@ -912,7 +859,7 @@ impl DeoxApp {
             }
         }
         if let Some((category, on)) = category_select {
-            for (i, _) in results.report.findings.iter().enumerate().filter(|(i, f)| f.category == category && f.confidence != Confidence::Info && self.visible[*i]) {
+            for i in selectable(&results.report, &self.visible, Some(category)) {
                 if on {
                     self.selected.insert(i);
                 } else {
@@ -921,9 +868,7 @@ impl DeoxApp {
             }
         }
         if select_visible {
-            for (i, _) in results.report.findings.iter().enumerate().filter(|(i, f)| f.confidence != Confidence::Info && self.visible[*i]) {
-                self.selected.insert(i);
-            }
+            self.selected.extend(selectable(&results.report, &self.visible, None));
         }
         if clicked_row.is_some() {
             self.cursor_row = clicked_row;
@@ -942,6 +887,61 @@ impl DeoxApp {
         }
         if uninstall.is_some() {
             self.pending_uninstall = uninstall;
+        }
+    }
+
+    /// Moves the keyboard cursor across rows and reports Space/Enter on the current row.
+    fn list_keys(&mut self, ui: &egui::Ui, row_pitch: f32) -> (Option<usize>, bool) {
+        if self.modal_open() {
+            return (None, false);
+        }
+        if let Some(id) = ui.memory(|m| m.focused()) {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                ui.memory_mut(|m| m.surrender_focus(id));
+            }
+            return (None, false);
+        }
+        if ui.ctx().egui_wants_keyboard_input() || self.rows.is_empty() {
+            return (None, false);
+        }
+        let none = egui::Modifiers::NONE;
+        let (down, up, home, end, space, enter) = ui.input_mut(|i| {
+            (
+                i.consume_key(none, egui::Key::ArrowDown),
+                i.consume_key(none, egui::Key::ArrowUp),
+                i.consume_key(none, egui::Key::Home),
+                i.consume_key(none, egui::Key::End),
+                i.consume_key(none, egui::Key::Space),
+                i.consume_key(none, egui::Key::Enter),
+            )
+        });
+        let last = self.rows.len() - 1;
+        let current = self.cursor_row;
+        let moved_to = if down {
+            Some(current.map_or(0, |c| (c + 1).min(last)))
+        } else if up {
+            Some(current.map_or(0, |c| c.saturating_sub(1)))
+        } else if home {
+            Some(0)
+        } else if end {
+            Some(last)
+        } else {
+            None
+        };
+        if let Some(target) = moved_to {
+            self.cursor_row = Some(target);
+            let (offset, height) = self.scroll_state;
+            let top = target as f32 * row_pitch;
+            if top < offset {
+                self.scroll_to = Some(top);
+            } else if top + row_pitch > offset + height {
+                self.scroll_to = Some(top + row_pitch - height);
+            }
+        }
+        if (space || enter) && current.is_some() {
+            (current, enter)
+        } else {
+            (None, false)
         }
     }
 
@@ -990,176 +990,186 @@ impl DeoxApp {
     fn dialogs(&mut self, ctx: &egui::Context) {
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if self.confirm_delete {
-            let mut summary: Vec<(Category, usize, u64)> = Vec::new();
-            let mut total = 0;
-            let mut count = 0;
-            if let Some(results) = &self.results {
-                for f in self.selected.iter().filter_map(|i| results.report.findings.get(*i)) {
-                    total += f.size;
-                    count += 1;
-                    match summary.iter_mut().find(|(c, _, _)| *c == f.category) {
-                        Some(row) => {
-                            row.1 += 1;
-                            row.2 += f.size;
-                        }
-                        None => summary.push((f.category, 1, f.size)),
+            self.confirm_delete_dialog(ctx, escape);
+        }
+        self.delete_report_dialog(ctx, escape);
+        self.uninstall_dialog(ctx, escape);
+        self.error_dialog(ctx, escape);
+    }
+
+    fn confirm_delete_dialog(&mut self, ctx: &egui::Context, escape: bool) {
+        let mut summary: Vec<(Category, usize, u64)> = Vec::new();
+        let mut total = 0;
+        let mut count = 0;
+        if let Some(results) = &self.results {
+            for f in self.selected.iter().filter_map(|i| results.report.findings.get(*i)) {
+                total += f.size;
+                count += 1;
+                match summary.iter_mut().find(|(c, _, _)| *c == f.category) {
+                    Some(row) => {
+                        row.1 += 1;
+                        row.2 += f.size;
                     }
+                    None => summary.push((f.category, 1, f.size)),
                 }
             }
-            summary.sort_by_key(|(_, _, size)| std::cmp::Reverse(*size));
-            let mut run = false;
-            let mut cancel = false;
-            let title = if self.dry_run { "Check before moving" } else { "Move to Recycle Bin?" };
-            egui::Window::new(title).collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.set_width(dialog_width(ctx, 640.0));
-                ui.label(format!("{} ({}) will be moved to the Recycle Bin. You can restore them from there.", items(count), human(total)));
-                ui.label("Anything that changed since the scan, or sits in a protected location, is skipped.");
-                ui.add_space(6.0);
-                for (category, n, size) in &summary {
-                    ui.horizontal(|ui| {
-                        cell(ui, SIZE_W, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(human(*size)).monospace());
-                        });
-                        ui.label(format!("{}  ·  {}", category_name(*category), items(*n)));
+        }
+        summary.sort_by_key(|(_, _, size)| std::cmp::Reverse(*size));
+        let mut run = false;
+        let mut cancel = false;
+        let title = if self.dry_run { "Check before moving" } else { "Move to Recycle Bin?" };
+        egui::Window::new(title).collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_width(dialog_width(ctx, 640.0));
+            ui.label(format!("{} ({}) will be moved to the Recycle Bin. You can restore them from there.", items(count), human(total)));
+            ui.label("Anything that changed since the scan, or sits in a protected location, is skipped.");
+            ui.add_space(6.0);
+            for (category, n, size) in &summary {
+                ui.horizontal(|ui| {
+                    cell(ui, SIZE_W, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(human(*size)).monospace());
                     });
+                    ui.label(format!("{}  ·  {}", category_name(*category), items(*n)));
+                });
+            }
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new("Show every item").show(ui, |ui| {
+                let Some(results) = &self.results else { return };
+                let mut indices: Vec<usize> = self.selected.iter().copied().collect();
+                indices.sort_unstable();
+                egui::ScrollArea::vertical().max_height(260.0).show_rows(ui, 18.0, indices.len(), |ui, range| {
+                    for f in indices[range].iter().filter_map(|i| results.report.findings.get(*i)) {
+                        ui.add(egui::Label::new(format!("{:>10}  {}", human(f.size), f.path.display())).truncate());
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(if self.dry_run { "Preview only is on: nothing will be moved." } else { "Move for real is on." }).weak(),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let label = if self.dry_run { "Check items".to_string() } else { format!("Move {} to Recycle Bin", items(count)) };
+                run = ui.button(label).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if run {
+            self.confirm_delete = false;
+            self.begin_delete(self.selected_findings(), self.dry_run);
+        } else if cancel || escape {
+            self.confirm_delete = false;
+        }
+    }
+
+    fn delete_report_dialog(&mut self, ctx: &egui::Context, escape: bool) {
+        let Some((report, dry_run)) = &self.last_delete else { return };
+        let mut close = false;
+        let mut move_now = false;
+        egui::Window::new(if *dry_run { "Check complete" } else { "Moved to Recycle Bin" })
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(dialog_width(ctx, 640.0));
+                let count = |o: fn(&Outcome) -> bool| report.entries.iter().filter(|e| o(&e.outcome)).count();
+                let ready = count(|o| *o == Outcome::WouldDelete);
+                if *dry_run {
+                    ui.label(format!("{} can be moved. Nothing was changed.", items(ready)));
+                } else {
+                    ui.label(format!(
+                        "{} moved to the Recycle Bin. Empty the Recycle Bin to free {}.",
+                        items(count(|o| *o == Outcome::Deleted)),
+                        human(report.freed_bytes())
+                    ));
                 }
-                ui.add_space(6.0);
-                egui::CollapsingHeader::new("Show every item").show(ui, |ui| {
-                    let Some(results) = &self.results else { return };
-                    let mut indices: Vec<usize> = self.selected.iter().copied().collect();
-                    indices.sort_unstable();
-                    egui::ScrollArea::vertical().max_height(260.0).show_rows(ui, 18.0, indices.len(), |ui, range| {
-                        for f in indices[range].iter().filter_map(|i| results.report.findings.get(*i)) {
-                            ui.add(egui::Label::new(format!("{:>10}  {}", human(f.size), f.path.display())).truncate());
+                if report.cancelled {
+                    ui.label(format!("Stopped early. {} left exactly as they were.", items(report.not_attempted)));
+                }
+                let problems: Vec<_> =
+                    report.entries.iter().filter(|e| e.outcome != Outcome::Deleted && e.outcome != Outcome::WouldDelete).collect();
+                if !problems.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(format!("{} skipped:", items(problems.len())));
+                    if problems.iter().any(|e| matches!(e.outcome, Outcome::Failed(_))) {
+                        ui.label(RichText::new("Windows refused some items, usually because a program is using them. Close browsers, chat apps and editors, then scan and try again.").weak());
+                    }
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        let mut shown: Vec<_> = problems.iter().take(MAX_LISTED_SKIPS).collect();
+                        shown.sort_by_key(|e| describe(&e.outcome));
+                        let mut current = String::new();
+                        for e in shown {
+                            let reason = describe(&e.outcome);
+                            if reason != current {
+                                let count = problems.iter().filter(|p| describe(&p.outcome) == reason).count();
+                                ui.add_space(6.0);
+                                let heading = ui.add(egui::Label::new(RichText::new(format!("{reason}, {}", items(count))).strong()));
+                                if let Outcome::Failed(why) = &e.outcome {
+                                    heading.on_hover_text(why);
+                                }
+                                current = reason;
+                            }
+                            ui.add(egui::Label::new(RichText::new(e.path.display().to_string()).weak().small()).wrap());
+                        }
+                        if problems.len() > MAX_LISTED_SKIPS {
+                            ui.label(format!("…and {} more. All of them are in the action log.", items(problems.len() - MAX_LISTED_SKIPS)));
                         }
                     });
-                });
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(if self.dry_run { "Preview only is on: nothing will be moved." } else { "Move for real is on." }).weak(),
-                );
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let label = if self.dry_run { "Check items".to_string() } else { format!("Move {} to Recycle Bin", items(count)) };
-                    run = ui.button(label).clicked();
-                    cancel = ui.button("Cancel").clicked();
+                    if *dry_run && ready > 0 {
+                        move_now = ui.button(format!("Move {} to Recycle Bin", items(ready))).clicked();
+                    }
+                    close = ui.button(if *dry_run && ready > 0 { "Not now" } else { "Close" }).clicked();
                 });
             });
-            if run {
-                self.confirm_delete = false;
-                self.begin_delete(self.selected_findings(), self.dry_run);
-            } else if cancel || escape {
-                self.confirm_delete = false;
-            }
+        if move_now {
+            self.last_delete = None;
+            self.dry_run = false;
+            self.begin_delete(self.selected_findings(), false);
+        } else if close || escape {
+            self.last_delete = None;
         }
+    }
 
-        if let Some((report, dry_run)) = &self.last_delete {
-            let mut close = false;
-            let mut move_now = false;
-            egui::Window::new(if *dry_run { "Check complete" } else { "Moved to Recycle Bin" })
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.set_width(dialog_width(ctx, 640.0));
-                    let count = |o: fn(&Outcome) -> bool| report.entries.iter().filter(|e| o(&e.outcome)).count();
-                    let ready = count(|o| *o == Outcome::WouldDelete);
-                    if *dry_run {
-                        ui.label(format!("{} can be moved. Nothing was changed.", items(ready)));
-                    } else {
-                        ui.label(format!(
-                            "{} moved to the Recycle Bin. Empty the Recycle Bin to free {}.",
-                            items(count(|o| *o == Outcome::Deleted)),
-                            human(report.freed_bytes())
-                        ));
-                    }
-                    if report.cancelled {
-                        ui.label(format!("Stopped early. {} left exactly as they were.", items(report.not_attempted)));
-                    }
-                    let problems: Vec<_> =
-                        report.entries.iter().filter(|e| e.outcome != Outcome::Deleted && e.outcome != Outcome::WouldDelete).collect();
-                    if !problems.is_empty() {
-                        ui.add_space(6.0);
-                        ui.label(format!("{} skipped:", items(problems.len())));
-                        if problems.iter().any(|e| matches!(e.outcome, Outcome::Failed(_))) {
-                            ui.label(RichText::new("Windows refused some items, usually because a program is using them. Close browsers, chat apps and editors, then scan and try again.").weak());
-                        }
-                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                            let mut shown: Vec<_> = problems.iter().take(MAX_LISTED_SKIPS).collect();
-                            shown.sort_by_key(|e| describe(&e.outcome));
-                            let mut current = String::new();
-                            for e in shown {
-                                let reason = describe(&e.outcome);
-                                if reason != current {
-                                    let count = problems.iter().filter(|p| describe(&p.outcome) == reason).count();
-                                    ui.add_space(6.0);
-                                    let heading = ui.add(egui::Label::new(RichText::new(format!("{reason}, {}", items(count))).strong()));
-                                    if let Outcome::Failed(why) = &e.outcome {
-                                        heading.on_hover_text(why);
-                                    }
-                                    current = reason;
-                                }
-                                ui.add(egui::Label::new(RichText::new(e.path.display().to_string()).weak().small()).wrap());
-                            }
-                            if problems.len() > MAX_LISTED_SKIPS {
-                                ui.label(format!("…and {} more. All of them are in the action log.", items(problems.len() - MAX_LISTED_SKIPS)));
-                            }
-                        });
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if *dry_run && ready > 0 {
-                            move_now = ui.button(format!("Move {} to Recycle Bin", items(ready))).clicked();
-                        }
-                        close = ui.button(if *dry_run && ready > 0 { "Not now" } else { "Close" }).clicked();
-                    });
-                });
-            if move_now {
-                self.last_delete = None;
-                self.dry_run = false;
-                self.begin_delete(self.selected_findings(), false);
-            } else if close || escape {
-                self.last_delete = None;
-            }
-        }
-
-        if let Some(i) = self.pending_uninstall {
-            let finding = self.results.as_ref().and_then(|r| r.report.findings.get(i)).cloned();
-            let mut done = finding.is_none();
-            if let Some(finding) = finding {
-                egui::Window::new("Open uninstaller").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                    ui.set_width(dialog_width(ctx, 520.0));
-                    ui.label(&finding.reason);
-                    ui.label("Deox only starts the program's own uninstaller. It removes nothing itself.");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Open uninstaller").clicked() {
-                            if let Err(e) = launch_uninstaller(&finding) {
-                                self.error = Some(format!("{e:#}"));
-                            }
-                            done = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            done = true;
-                        }
-                    });
-                });
-            }
-            if done || escape {
-                self.pending_uninstall = None;
-            }
-        }
-
-        if let Some(message) = &self.error {
-            let mut close = false;
-            egui::Window::new("Couldn't complete that").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.set_width(dialog_width(ctx, 480.0));
-                ui.label(message);
+    fn uninstall_dialog(&mut self, ctx: &egui::Context, escape: bool) {
+        let Some(i) = self.pending_uninstall else { return };
+        let finding = self.results.as_ref().and_then(|r| r.report.findings.get(i)).cloned();
+        let mut done = finding.is_none();
+        if let Some(finding) = finding {
+            egui::Window::new("Open uninstaller").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.set_width(dialog_width(ctx, 520.0));
+                ui.label(&finding.reason);
+                ui.label("Deox only starts the program's own uninstaller. It removes nothing itself.");
                 ui.add_space(6.0);
-                close = ui.button("Close").clicked();
+                ui.horizontal(|ui| {
+                    if ui.button("Open uninstaller").clicked() {
+                        if let Err(e) = launch_uninstaller(&finding) {
+                            self.error = Some(format!("{e:#}"));
+                        }
+                        done = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        done = true;
+                    }
+                });
             });
-            if close || escape {
-                self.error = None;
-            }
+        }
+        if done || escape {
+            self.pending_uninstall = None;
+        }
+    }
+
+    fn error_dialog(&mut self, ctx: &egui::Context, escape: bool) {
+        let Some(message) = &self.error else { return };
+        let mut close = false;
+        egui::Window::new("Couldn't complete that").collapsible(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.set_width(dialog_width(ctx, 480.0));
+            ui.label(message);
+            ui.add_space(6.0);
+            close = ui.button("Close").clicked();
+        });
+        if close || escape {
+            self.error = None;
         }
     }
 }
@@ -1173,7 +1183,7 @@ impl eframe::App for DeoxApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let modal = self.confirm_delete || self.last_delete.is_some() || self.pending_uninstall.is_some() || self.error.is_some();
+        let modal = self.modal_open();
         ui.add_enabled_ui(!modal, |ui| {
             egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
             let frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(20, 14));
@@ -1206,6 +1216,14 @@ fn scan_notes(ui: &mut egui::Ui, results: &Results) {
     ui.label(RichText::new(format!("{} files scanned.{skipped}", results.files)).weak());
 }
 
+/// Indices of findings that pass the current filter and can be selected for removal (optionally within one category).
+fn selectable<'a>(report: &'a Report, visible: &'a [bool], category: Option<Category>) -> impl Iterator<Item = usize> + 'a {
+    report.findings.iter().enumerate().filter_map(move |(i, f)| {
+        let in_group = category.is_none_or(|c| f.category == c);
+        (in_group && f.confidence != Confidence::Info && visible.get(i).copied().unwrap_or(false)).then_some(i)
+    })
+}
+
 /// Case-insensitive match on a finding's path or rule name; an empty filter matches everything.
 fn matches_filter(finding: &Finding, needle: &str) -> bool {
     needle.is_empty()
@@ -1214,5 +1232,4 @@ fn matches_filter(finding: &Finding, needle: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "screens_test.rs"]
-mod screens;
+mod screens_test;

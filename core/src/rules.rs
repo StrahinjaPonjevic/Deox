@@ -119,11 +119,14 @@ fn enclosing_artifacts<'p, 'r>(index: &'p Index, dirs: &'p [PathBuf], dir_rules:
     if index.root.ancestors().any(|dir| matched(dir).is_some()) {
         return vec![None; dirs.len()];
     }
-    let mut enclosing = Vec::with_capacity(dirs.len());
+    let in_dot_folder = index.in_dot_folder();
+    let mut enclosing: Vec<Match> = Vec::with_capacity(dirs.len());
     enclosing.push(None);
     for (dir, path) in index.dirs.iter().zip(dirs).skip(1) {
-        let parent = dir.parent.and_then(|p| enclosing[p as usize]);
-        enclosing.push(parent.or_else(|| matched(path)));
+        let parent = dir.parent.map_or(0, |parent| parent as usize);
+        // A match inside a dot folder (an editor extension's dependencies, say) is part of a tool,
+        // while a dot folder that matches by itself, such as `.venv`, is a project's own.
+        enclosing.push(enclosing[parent].or_else(|| matched(path).filter(|_| !in_dot_folder[parent])));
     }
     enclosing
 }

@@ -9,6 +9,11 @@ fn write(path: &Path, content: &[u8]) {
     fs::write(path, content).unwrap();
 }
 
+/// The default temporary folder name starts with a dot, which would hide everything in it.
+fn temp_dir() -> tempfile::TempDir {
+    tempfile::Builder::new().prefix("deox-").tempdir().unwrap()
+}
+
 fn find(dir: &Path) -> Duplicates {
     let cancel = Cancel::default();
     find_duplicates(&scan(dir, &cancel, |_, _, _, _| {}), &cancel, 1, &|_, _, _| {})
@@ -16,7 +21,7 @@ fn find(dir: &Path) -> Duplicates {
 
 #[test]
 fn identical_files_are_grouped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("a.txt"), b"same content");
     write(&dir.path().join("sub/b.txt"), b"same content");
 
@@ -28,8 +33,23 @@ fn identical_files_are_grouped() {
 }
 
 #[test]
+fn copies_under_dot_names_are_left_to_their_tools() {
+    let dir = temp_dir();
+    write(&dir.path().join("a.txt"), b"same content");
+    write(&dir.path().join(".git/objects/b"), b"same content");
+    write(&dir.path().join("sub/.hidden"), b"same content");
+
+    assert!(find(dir.path()).groups.is_empty());
+
+    // Choosing the dot folder itself changes nothing.
+    write(&dir.path().join(".git/objects/c"), b"same content");
+    assert!(find(&dir.path().join(".git")).groups.is_empty());
+    assert!(find(&dir.path().join(".git/objects")).groups.is_empty());
+}
+
+#[test]
 fn same_name_or_size_with_different_content_is_not_a_duplicate() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("x/report.txt"), b"content one");
     write(&dir.path().join("y/report.txt"), b"content two");
 
@@ -38,7 +58,7 @@ fn same_name_or_size_with_different_content_is_not_a_duplicate() {
 
 #[test]
 fn files_differing_only_after_the_first_64_kib_are_not_grouped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     let mut a = vec![7u8; 100_000];
     let mut b = a.clone();
     a[99_999] = 1;
@@ -55,7 +75,7 @@ fn files_differing_only_after_the_first_64_kib_are_not_grouped() {
 
 #[test]
 fn empty_files_are_ignored() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("a"), b"");
     write(&dir.path().join("b"), b"");
 
@@ -64,7 +84,7 @@ fn empty_files_are_ignored() {
 
 #[test]
 fn hard_links_are_not_duplicates() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("a.txt"), b"linked");
     fs::hard_link(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
     assert!(find(dir.path()).groups.is_empty());
@@ -77,7 +97,7 @@ fn hard_links_are_not_duplicates() {
 
 #[test]
 fn at_least_one_copy_always_remains() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     for name in ["a", "b", "c"] {
         write(&dir.path().join(name), b"three copies");
     }
@@ -94,7 +114,7 @@ fn at_least_one_copy_always_remains() {
 
 #[test]
 fn unreadable_file_is_reported_not_fatal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("a"), b"data");
     write(&dir.path().join("b"), b"data");
     write(&dir.path().join("c"), b"data");
@@ -110,7 +130,7 @@ fn unreadable_file_is_reported_not_fatal() {
 
 #[test]
 fn cancelled_search_returns_no_groups() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("a"), b"data");
     write(&dir.path().join("b"), b"data");
     let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
@@ -125,7 +145,7 @@ fn cancelled_search_returns_no_groups() {
 
 #[test]
 fn files_below_the_minimum_size_are_ignored() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("small_a"), &[1u8; 100]);
     write(&dir.path().join("small_b"), &[1u8; 100]);
     write(&dir.path().join("big_a"), &[2u8; 5000]);
@@ -141,7 +161,7 @@ fn files_below_the_minimum_size_are_ignored() {
 
 #[test]
 fn progress_is_reported_for_every_phase() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     write(&dir.path().join("a"), b"data");
     write(&dir.path().join("b"), b"data");
     let cancel = Cancel::default();

@@ -1,6 +1,6 @@
 use crate::protect::is_protected;
 use crate::report::{Category, Confidence, Finding};
-use crate::scan::{Cancel, FileEntry, Index, ScanError};
+use crate::scan::{is_dot_name, Cancel, FileEntry, Index, ScanError};
 use blake3::{Hash, Hasher};
 use rayon::prelude::*;
 use same_file::Handle;
@@ -47,7 +47,12 @@ pub fn find_duplicates(
     let errors = Mutex::new(Vec::new());
 
     let mut by_size: HashMap<u64, Vec<&FileEntry>> = HashMap::new();
-    for file in index.files.iter().filter(|f| f.size > 0 && f.size >= min_size) {
+    // Copies a tool keeps under dot names (`.git`, editor extensions) are not spare copies.
+    let in_dot_folder = index.in_dot_folder();
+    let comparable = |f: &&FileEntry| {
+        f.size > 0 && f.size >= min_size && !in_dot_folder[f.dir as usize] && !is_dot_name(&f.name)
+    };
+    for file in index.files.iter().filter(comparable) {
         by_size.entry(file.size).or_default().push(file);
     }
     let candidates: Vec<&FileEntry> = by_size.into_values().filter(|g| g.len() > 1).flatten().collect();

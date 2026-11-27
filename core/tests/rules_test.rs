@@ -91,6 +91,28 @@ fn scan_starting_at_or_inside_node_modules_offers_no_folder() {
 }
 
 #[test]
+fn a_virtual_environment_is_offered_but_dependencies_inside_dot_folders_are_not() {
+    let rules = Rules::builtin().unwrap();
+    let idx = index(vec![
+        file(r"C:\Users\a\.vscode\extensions\x\node_modules\y\index.js", 100, 200),
+        file(r"C:\Dev\proj\.venv\Lib\site.py", 70, 200),
+    ]);
+
+    let findings = rules.evaluate(&idx, now());
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].path, PathBuf::from(r"C:\Dev\proj\.venv"));
+
+    // Choosing the dot folder itself, or a folder below it, changes nothing.
+    for root in [r"C:\Users\a\.vscode", r"C:\Users\a\.vscode\extensions"] {
+        let mut builder = IndexBuilder::new(root);
+        let script = PathBuf::from(r"C:\Users\a\.vscode\extensions\x\node_modules\y\index.js");
+        builder.file(&script, 100, days_ago(200));
+        assert!(rules.evaluate(&builder.finish(), now()).is_empty(), "{root}");
+    }
+}
+
+#[test]
 fn active_project_keeps_its_node_modules() {
     let rules = Rules::builtin().unwrap();
     let idx = index(vec![

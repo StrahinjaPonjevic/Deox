@@ -4,6 +4,7 @@ use std::fs;
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn write(path: &Path, len: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -71,6 +72,49 @@ fn paths_are_rebuilt_exactly_from_the_folder_table() {
     assert!(index.dirs.iter().enumerate().skip(1).all(|(id, d)| d.parent.is_some_and(|p| (p as usize) < id)));
     let paths = index.dir_paths();
     assert!((0..index.dirs.len()).all(|id| paths[id] == index.dir_path(id as u32) && paths[id].is_dir()));
+}
+
+#[test]
+fn a_junction_given_as_the_root_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    write(&outside.join("secret.txt"), 1);
+    let link = dir.path().join("link");
+    let status = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap().status;
+    assert!(status.success(), "junction could not be created");
+
+    let index = scan(&link, &Cancel::default(), |_, _, _, _| {});
+
+    assert!(index.files.is_empty());
+}
+
+/// Deletion compares these with what the disk reports for each file, so they must agree exactly.
+#[test]
+fn sizes_and_times_match_what_each_file_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    // Enough long names to need several batches from the system.
+    for i in 0..2_000 {
+        write(&dir.path().join(format!("{i:0>80}.bin")), i % 7);
+    }
+    // Deeper than the 260 characters of the classic path limit, with non-ASCII names.
+    let mut deep = dir.path().to_path_buf();
+    for _ in 0..12 {
+        deep.push("fascikla-čćžšđ-日本-0123456789");
+    }
+    write(&deep.join("dno ✓.txt"), 5);
+    let old = fs::File::options().write(true).open(deep.join("dno ✓.txt")).unwrap();
+    old.set_modified(UNIX_EPOCH + Duration::new(1_000_000_000, 123_456_700)).unwrap();
+    drop(old);
+
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
+
+    assert!(index.errors.is_empty());
+    assert_eq!(index.files.len(), 2_001);
+    assert!(index.files.iter().any(|f| index.file_path(f) == deep.join("dno ✓.txt")));
+    for file in &index.files {
+        let meta = fs::symlink_metadata(index.file_path(file)).unwrap();
+        assert_eq!((file.size, file.modified), (meta.len(), meta.modified().ok()));
+    }
 }
 
 /// Denies listing a directory for the lifetime of the guard.

@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::time::SystemTime;
 
+use crate::listing::{read_folder, Entry};
 use crate::protect::is_skippable_dir;
 
 /// Cooperative cancellation flag, safe to share between threads.
@@ -81,6 +84,26 @@ impl Index {
     pub fn file_path(&self, file: &FileEntry) -> PathBuf {
         self.dir_path(file.dir).join(&*file.name)
     }
+
+    /// For each folder in [`Index::dirs`], whether it, or any folder above it, has a name starting
+    /// with a dot. Tools keep their own data there: it is measured like everything else, but
+    /// offered for removal only where a rule names it.
+    pub fn in_dot_folder(&self) -> Vec<bool> {
+        let mut inside: Vec<bool> = Vec::with_capacity(self.dirs.len());
+        for dir in &self.dirs {
+            inside.push(match dir.parent {
+                Some(parent) => inside[parent as usize] || is_dot_name(&dir.name),
+                // The folders above the root count too, so the answer for a file does not
+                // depend on where the scan started.
+                None => self.root.components().any(|c| matches!(c, Component::Normal(name) if is_dot_name(name))),
+            });
+        }
+        inside
+    }
+}
+
+pub(crate) fn is_dot_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b".")
 }
 
 /// Builds an [`Index`] from full paths.
@@ -153,6 +176,9 @@ pub fn scan_with_folders(
 
 /// The walk behind [`scan_with_folders`], with the folder-skipping rule passed in.
 /// The root itself is never skipped, only folders below it.
+///
+/// Folders are read in parallel, so their order differs between runs. The callbacks run on the
+/// calling thread.
 pub fn walk(
     root: &Path,
     cancel: &Cancel,
@@ -161,51 +187,83 @@ pub fn walk(
     skip: fn(&Path) -> bool,
 ) -> Index {
     let mut builder = IndexBuilder::new(root);
+    // A link given as the root is not followed either.
+    if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_symlink()) {
+        return builder.finish();
+    }
     let mut bytes = 0u64;
-    let walker = jwalk::WalkDir::new(root).process_read_dir(move |depth, _, _, children| {
-        // `depth` is `None` for the pseudo listing that holds only the root itself.
-        if depth.is_none() {
+    let (sender, listings) = mpsc::channel();
+    std::thread::scope(|threads| {
+        threads.spawn(move || rayon::scope(|pool| read_tree(pool, root.to_path_buf(), cancel, skip, sender)));
+        // Only this thread touches the index; the workers just read folders.
+        for listing in listings {
+            if cancel.is_cancelled() {
+                break;
+            }
+            // Already known from its parent's listing, which always arrives first.
+            let dir = builder.dir(&listing.path);
+            on_folder(&listing.path);
+            for folder in &listing.folders {
+                builder.dir(folder);
+            }
+            if let Some(e) = listing.error {
+                builder.index.errors.push(ScanError { path: Some(listing.path.clone()), message: e.to_string() });
+            }
+            for file in listing.files {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let path = listing.path.join(&file.name);
+                let name = file.name.into_boxed_os_str();
+                builder.index.files.push(FileEntry { dir, name, size: file.size, modified: file.modified });
+                bytes += file.size;
+                progress(builder.index.files.len() as u64, bytes, &path, file.size);
+            }
+        }
+    });
+    builder.index.cancelled = cancel.is_cancelled();
+    builder.finish()
+}
+
+/// What one folder holds, as read by a worker.
+struct Listing {
+    path: PathBuf,
+    files: Vec<Entry>,
+    /// Subfolders that will be read too.
+    folders: Vec<PathBuf>,
+    error: Option<io::Error>,
+}
+
+/// Reads `path` and queues its subfolders on the pool.
+fn read_tree<'s>(
+    pool: &rayon::Scope<'s>,
+    path: PathBuf,
+    cancel: &'s Cancel,
+    skip: fn(&Path) -> bool,
+    sender: Sender<Listing>,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let (mut files, mut folders) = (Vec::new(), Vec::new());
+    let error = read_folder(&path, cancel, |entry| {
+        if !entry.is_dir {
+            files.push(entry);
             return;
         }
-        children.retain(|c| !c.as_ref().is_ok_and(|e| e.file_type().is_dir() && skip(&e.path())));
-    });
-    for entry in walker {
-        if cancel.is_cancelled() {
-            builder.index.cancelled = true;
-            break;
+        let folder = path.join(&entry.name);
+        if !skip(&folder) {
+            folders.push(folder);
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                let path = e.path().map(Path::to_path_buf);
-                builder.index.errors.push(ScanError { path, message: e.to_string() });
-                continue;
-            }
-        };
-        // A directory that could not be listed is reported on the directory entry itself.
-        if let Some(e) = entry.read_children.as_ref().and_then(|r| r.error()) {
-            builder.index.errors.push(ScanError { path: Some(entry.path()), message: e.to_string() });
-        }
-        if entry.file_type().is_dir() {
-            let path = entry.path();
-            on_folder(&path);
-            if entry.depth() > 0 {
-                builder.dir(&path);
-            }
-        }
-        // The root is a folder; a file given as the root is not indexed.
-        if entry.depth() == 0 || !entry.file_type().is_file() {
-            continue;
-        }
-        match entry.metadata() {
-            Ok(meta) => {
-                let path = entry.path();
-                builder.file(&path, meta.len(), meta.modified().ok());
-                bytes += meta.len();
-                progress(builder.index.files.len() as u64, bytes, &path, meta.len());
-            }
-            Err(e) => builder.index.errors.push(ScanError { path: Some(entry.path()), message: e.to_string() }),
-        }
+    })
+    .err();
+    let subfolders = folders.clone();
+    // Sent before the subfolders are queued, so a parent always arrives before its children.
+    if sender.send(Listing { path, files, folders, error }).is_err() {
+        return;
     }
-    builder.finish()
+    for folder in subfolders {
+        let sender = sender.clone();
+        pool.spawn(move |pool| read_tree(pool, folder, cancel, skip, sender));
+    }
 }

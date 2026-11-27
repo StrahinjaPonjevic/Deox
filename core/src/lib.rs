@@ -1,5 +1,6 @@
 pub mod delete;
 pub mod dupes;
+mod listing;
 pub mod orphans;
 pub mod programs;
 pub mod protect;

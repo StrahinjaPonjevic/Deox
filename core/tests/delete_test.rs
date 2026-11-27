@@ -1,9 +1,11 @@
 use deox_core::delete::{delete, delete_with_progress, launch_uninstaller, Outcome};
-use deox_core::scan::Cancel;
 use deox_core::report::{Category, Confidence, Finding, Report};
+use deox_core::rules::Rules;
+use deox_core::scan::{scan, Cancel};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 fn write(path: &Path, content: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -27,6 +29,28 @@ fn finding(path: &Path) -> Finding {
 
 fn run(findings: &[Finding], dry_run: bool, log: &Path) -> Vec<Outcome> {
     delete(findings, dry_run, log).unwrap().entries.into_iter().map(|e| e.outcome).collect()
+}
+
+/// A folder is moved only if its size still matches the scan, so the scan has to count
+/// everything the check counts, dot files included.
+#[test]
+fn a_scanned_folder_with_dot_files_passes_the_unchanged_check() {
+    // The default temporary folder name starts with a dot, so rules would offer nothing in it.
+    let dir = tempfile::Builder::new().prefix("deox-").tempdir().unwrap();
+    let modules = dir.path().join("proj/node_modules");
+    write(&modules.join("a/index.js"), b"code");
+    write(&modules.join(".package-lock.json"), b"lock");
+    write(&modules.join(".bin/a.cmd"), b"shim");
+    let rules = Rules::from_toml(
+        "[[rule]]\nname = \"R\"\ncategory = \"DevArtifact\"\nconfidence = \"Review\"\nkind = \"dir\"\n\
+         path_glob = \"**/node_modules\"\nreason = \"x\"\n",
+    )
+    .unwrap();
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
+
+    let findings = rules.evaluate(&index, SystemTime::now());
+
+    assert_eq!(run(&findings, true, &dir.path().join("actions.log")), vec![Outcome::WouldDelete]);
 }
 
 /// The Recycle Bin reports long paths, while a temp folder may be given by its short 8.3 name.

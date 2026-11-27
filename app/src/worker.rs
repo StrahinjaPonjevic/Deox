@@ -7,7 +7,7 @@ use deox_core::orphans::find_orphaned_appdata;
 use deox_core::programs::{installed_programs, AppxRegistry, BloatwareList, WindowsRegistry};
 use deox_core::report::Finding;
 use deox_core::rules::Rules;
-use deox_core::scan::{scan_with_folders, Cancel};
+use deox_core::scan::{scan_with_folders, Cancel, Index};
 use deox_core::treemap::{FolderTree, LiveTree};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -29,8 +29,14 @@ pub struct Analysis {
     /// Paths that could not be read (no permission, in use).
     pub unreadable: usize,
     pub cancelled: bool,
-    /// Folder sizes for the map view; `None` when the scan was cancelled.
-    pub tree: Option<FolderTree>,
+    /// `None` when the scan was cancelled.
+    pub scanned: Option<Scanned>,
+}
+
+/// What a finished scan leaves behind: every file, and the totals the map is drawn from.
+pub struct Scanned {
+    pub index: Index,
+    pub tree: FolderTree,
 }
 
 pub enum Msg {
@@ -139,7 +145,7 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, live: &Mutex<LiveTree>, noti
     );
     let files = index.files.len() as u64;
     let mut unreadable = index.errors.len();
-    let cancelled = |findings| Analysis { findings, files, unreadable, cancelled: true, tree: None };
+    let cancelled = |findings| Analysis { findings, files, unreadable, cancelled: true, scanned: None };
     if index.cancelled {
         return Ok(cancelled(Vec::new()));
     }
@@ -166,6 +172,6 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, live: &Mutex<LiveTree>, noti
     findings.extend(find_orphaned_appdata(root, &index, &programs, &findings, SystemTime::now()));
     findings.extend(BloatwareList::builtin()?.evaluate(&programs));
 
-    let tree = FolderTree::build(root, &index, &findings);
-    Ok(Analysis { findings, files, unreadable, cancelled: false, tree: Some(tree) })
+    let tree = FolderTree::build(&index, &findings);
+    Ok(Analysis { findings, files, unreadable, cancelled: false, scanned: Some(Scanned { index, tree }) })
 }

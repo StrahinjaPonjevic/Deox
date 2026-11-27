@@ -11,7 +11,7 @@ use deox_core::treemap::{FolderTree, LiveTree};
 use eframe::egui::{self, Color32, RichText};
 use map::{LiveMap, MapAction, MapState, Pick};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -19,7 +19,7 @@ use ui::{
     category_name, cell, confidence_tag, configure_theme, dialog_width, disclosure_icon, human, items, legend_line, level_glyph,
     name_checkbox, paths, reclaim_strip, scan_step, share_bar, step_ticks, sweep, CHECK_W, ITEM_INDENT, REVEAL_SECS, SIZE_W, TAG_W,
 };
-use worker::{Msg, Notifier};
+use worker::{Msg, Notifier, Scanned};
 
 /// Rows shown in the list of skipped items; longer lists are summarized.
 const MAX_LISTED_SKIPS: usize = 200;
@@ -62,8 +62,14 @@ struct Results {
     report: Report,
     files: u64,
     unreadable: usize,
-    /// Folder sizes for the map; updated after a move, so what was moved leaves the map as well.
-    tree: Option<FolderTree>,
+    /// Updated after a move, so what was moved leaves the map as well.
+    scanned: Option<Scanned>,
+}
+
+impl Results {
+    fn tree(&self) -> Option<&FolderTree> {
+        self.scanned.as_ref().map(|scanned| &scanned.tree)
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -251,11 +257,11 @@ impl DeoxApp {
         worker::spawn_delete(findings, dry_run, self.move_cancel.clone(), self.notifier());
     }
 
-    fn set_results(&mut self, findings: Vec<Finding>, files: u64, unreadable: usize, tree: Option<FolderTree>) {
+    fn set_results(&mut self, findings: Vec<Finding>, files: u64, unreadable: usize, scanned: Option<Scanned>) {
         // Only regenerating caches start selected; everything else is the user's call.
         self.selected =
             findings.iter().enumerate().filter(|(_, f)| f.confidence == Confidence::Safe).map(|(i, _)| i).collect();
-        self.results = Some(Results { report: Report::new(findings), files, unreadable, tree });
+        self.results = Some(Results { report: Report::new(findings), files, unreadable, scanned });
         // A long list of duplicates would push everything else off screen; the user opens it on purpose.
         self.collapsed.insert(Category::Duplicate);
         self.tab = View::List;
@@ -349,7 +355,7 @@ impl DeoxApp {
                     self.status = "Scan cancelled.".into();
                 } else {
                     self.status = String::new();
-                    self.set_results(a.findings, a.files, a.unreadable, a.tree);
+                    self.set_results(a.findings, a.files, a.unreadable, a.scanned);
                 }
             }
             Msg::Deleted(report) => {
@@ -373,17 +379,20 @@ impl DeoxApp {
     /// Removes findings that are gone from disk and keeps the rest selected as before.
     fn drop_findings(&mut self, gone: &HashSet<PathBuf>) {
         let Some(mut results) = self.results.take() else { return };
-        if let Some(tree) = &mut results.tree {
-            let removed: Vec<(&Path, u64, Confidence)> =
-                results.report.findings.iter().filter(|f| gone.contains(&f.path)).map(|f| (f.path.as_path(), f.size, f.confidence)).collect();
-            tree.remove_all(&removed);
-        }
-        self.map.picked = None;
         let keep_selected: HashSet<PathBuf> =
             self.selected.iter().filter_map(|i| results.report.findings.get(*i)).map(|f| f.path.clone()).collect();
-        let findings: Vec<Finding> = results.report.findings.into_iter().filter(|f| !gone.contains(&f.path)).collect();
+        // What was inside a moved folder is gone with it.
+        let findings: Vec<Finding> =
+            results.report.findings.into_iter().filter(|f| !f.path.ancestors().any(|a| gone.contains(a))).collect();
         self.selected =
             findings.iter().enumerate().filter(|(_, f)| keep_selected.contains(&f.path)).map(|(i, _)| i).collect();
+        if let Some(Scanned { index, tree }) = &mut results.scanned {
+            // shortcut: rebuilt on the window's thread, about 0.25 s for 420,000 files; move it to
+            // the worker if the pause after a move becomes noticeable.
+            index.remove(&gone.iter().map(PathBuf::as_path).collect());
+            *tree = FolderTree::build(index, &findings);
+        }
+        self.map.tree_rebuilt();
         self.results = Some(Results { report: Report::new(findings), ..results });
         self.rebuild_rows();
     }
@@ -631,7 +640,7 @@ impl DeoxApp {
                     });
                 });
             });
-            if let Some(tree) = &results.tree {
+            if let Some(tree) = results.tree() {
                 let elapsed = ui.input(|i| i.time) - self.reveal_start;
                 let progress = (elapsed / REVEAL_SECS).clamp(0.0, 1.0) as f32;
                 if progress < 1.0 {
@@ -644,7 +653,7 @@ impl DeoxApp {
         ui.separator();
 
         // Wide windows show the map beside the list; narrow ones switch between them.
-        let split = results.tree.is_some() && ui.available_width() >= SPLIT_MIN_WIDTH;
+        let split = results.tree().is_some() && ui.available_width() >= SPLIT_MIN_WIDTH;
         if split && self.tab == View::Map {
             self.tab = View::List;
         }
@@ -653,7 +662,7 @@ impl DeoxApp {
             if removable_count > 0 {
                 scan_notes(ui, results);
             }
-            if let Some(tree) = &results.tree {
+            if let Some(tree) = results.tree() {
                 let dark = ui.visuals().dark_mode;
                 let width = ui.available_width() * 0.55;
                 egui::Panel::left("map_panel").resizable(true).default_size(width).size_range(320.0..=width * 1.4).show(ui, |ui| {
@@ -663,7 +672,7 @@ impl DeoxApp {
         } else {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, View::List, "List");
-                ui.add_enabled_ui(results.tree.is_some(), |ui| {
+                ui.add_enabled_ui(results.tree().is_some(), |ui| {
                     ui.selectable_value(&mut self.tab, View::Map, "Map");
                 })
                 .response
@@ -674,7 +683,7 @@ impl DeoxApp {
             scan_notes(ui, results);
         }
 
-        if let (View::Map, Some(tree)) = (self.tab, &results.tree) {
+        if let (View::Map, Some(tree)) = (self.tab, results.tree()) {
             let dark = ui.visuals().dark_mode;
             if let Some(action) = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected) {
                 self.apply_map_action(action);
@@ -771,7 +780,7 @@ impl DeoxApp {
                             (name, finding.path.parent().map(|p| p.display().to_string()).unwrap_or_default())
                         };
                         let full_path = finding.path.display().to_string();
-                        let can_locate = results.tree.is_some() && !full_path.is_empty();
+                        let can_locate = results.tree().is_some() && !full_path.is_empty();
                         // The whole row is the click target. It is registered before its content, so the checkbox
                         // and buttons on top of it keep their own clicks.
                         let row_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), row_height));
@@ -949,7 +958,7 @@ impl DeoxApp {
     /// its file, or the small files of the folder when it is not listed one by one.
     fn show_on_map(&mut self, finding: usize) {
         let Some(results) = &self.results else { return };
-        let (Some(tree), Some(f)) = (&results.tree, results.report.findings.get(finding)) else { return };
+        let (Some(tree), Some(f)) = (results.tree(), results.report.findings.get(finding)) else { return };
         let (found, exact) = tree.locate(&f.path);
         let (folder, pick) = if exact {
             let own = found != FolderTree::ROOT;

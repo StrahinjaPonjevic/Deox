@@ -103,7 +103,7 @@ fn main() -> anyhow::Result<()> {
             timed(|| find_orphaned_appdata(&root, &index, &programs, &findings, SystemTime::now()));
         println!("  orphaned app data     {seconds:8.2} s");
         findings.extend(orphans);
-        let (_tree, seconds) = timed(|| FolderTree::build(&root, &index, &findings));
+        let (_tree, seconds) = timed(|| FolderTree::build(&index, &findings));
         println!("  folder tree           {seconds:8.2} s");
     }
     Ok(())

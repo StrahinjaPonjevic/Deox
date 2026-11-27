@@ -6,6 +6,7 @@ use deox_core::scan::IndexBuilder;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{wgpu::WgpuTestRenderer, Harness};
 use std::fs;
+use std::path::Path;
 
 fn finding(path: &Path, size: u64, category: Category, confidence: Confidence) -> Finding {
     Finding {
@@ -20,10 +21,10 @@ fn finding(path: &Path, size: u64, category: Category, confidence: Confidence) -
     }
 }
 
-/// Findings and a folder tree over a made-up scan, so no files are written.
+/// Findings and a made-up scan, so no files are written.
 struct Demo {
     findings: Vec<Finding>,
-    tree: FolderTree,
+    scanned: Scanned,
     files: u64,
 }
 
@@ -43,8 +44,8 @@ fn demo_at(root: &Path) -> Demo {
         finding(&root.join("Projects/app/node_modules"), 1_500_000, Category::DevArtifact, Confidence::Review),
         finding(&root.join("Downloads/d39.bin"), 870_000, Category::Duplicate, Confidence::Review),
     ];
-    let tree = FolderTree::build(root, &index, &findings);
-    Demo { files: index.files.len() as u64, findings, tree }
+    let tree = FolderTree::build(&index, &findings);
+    Demo { files: index.files.len() as u64, findings, scanned: Scanned { index, tree } }
 }
 
 fn demo() -> Demo {
@@ -76,8 +77,8 @@ fn harness(size: egui::Vec2, make: impl FnOnce(&mut DeoxApp) + 'static) -> Harne
 }
 
 fn results_harness(size: egui::Vec2) -> Harness<'static, DeoxApp> {
-    let Demo { findings, tree, files } = demo();
-    harness(size, move |app| app.set_results(findings, files, 0, Some(tree)))
+    let Demo { findings, scanned, files } = demo();
+    harness(size, move |app| app.set_results(findings, files, 0, Some(scanned)))
 }
 
 fn shot(harness: &mut Harness<'_, DeoxApp>, name: &str) {
@@ -217,15 +218,37 @@ fn the_map_survives_a_move_to_the_recycle_bin() {
     let mut h = results_harness(WIDE);
     h.run();
     let gone: HashSet<PathBuf> = h.state().results.as_ref().unwrap().report.findings.iter().take(1).map(|f| f.path.clone()).collect();
-    let before = h.state().results.as_ref().unwrap().tree.as_ref().unwrap().node(FolderTree::ROOT).size;
+    let before = h.state().results.as_ref().unwrap().tree().unwrap().node(FolderTree::ROOT).size;
 
     h.state_mut().drop_findings(&gone);
     shot(&mut h, "results_after_move");
 
     let results = h.state().results.as_ref().unwrap();
-    let tree = results.tree.as_ref().expect("the tree is kept");
+    let tree = results.tree().expect("the tree is kept");
     assert!(tree.node(FolderTree::ROOT).size < before, "its sizes shrink instead of the map disappearing");
     assert_eq!(results.report.findings.len(), 3);
+}
+
+#[test]
+fn moving_a_folder_drops_what_was_inside_it_while_the_map_shows_it() {
+    let _gpu = gpu();
+    let Demo { mut findings, scanned, files } = demo();
+    let temp = Path::new(r"C:\Demo\Temp");
+    findings.push(finding(&temp.join("t0.bin"), 20_000, Category::Duplicate, Confidence::Review));
+    let (temp_id, _) = scanned.tree.locate(temp);
+    let mut h = harness(NARROW, move |app| app.set_results(findings, files, 0, Some(scanned)));
+    h.get_by_label("Map").click();
+    h.run();
+    h.state_mut().map.open(temp_id, 0.0, None);
+    h.run();
+
+    h.state_mut().drop_findings(&HashSet::from([temp.to_path_buf()]));
+    h.run();
+
+    let results = h.state().results.as_ref().unwrap();
+    assert!(results.report.findings.iter().all(|f| !f.path.starts_with(temp)));
+    assert_eq!(results.scanned.as_ref().unwrap().index.files.len(), files as usize - 40);
+    assert!(h.query_by_label("This folder is empty.").is_some());
 }
 
 #[test]
@@ -233,8 +256,8 @@ fn a_long_folder_name_does_not_push_the_size_out_of_the_map_panel() {
     let _gpu = gpu();
     let deep = r"AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage\Deeply Nested Folder Name";
     let root = format!(r"C:\Users\Some Person\{deep}\{deep}");
-    let Demo { findings, tree, files } = demo_at(Path::new(&root));
-    let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(tree)));
+    let Demo { findings, scanned, files } = demo_at(Path::new(&root));
+    let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(scanned)));
     shot(&mut h, "results_long_name");
 
     let sizes: Vec<egui::Rect> = h.query_all_by_label_contains("MB").map(|n| n.rect()).filter(|r| r.min.y > 560.0).collect();
@@ -251,8 +274,8 @@ fn long_root_breadcrumb_stays_on_one_line() {
 
     let deep = r"AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage\Deeply Nested Folder Name";
     let root = format!(r"C:\Users\Some Person\{deep}\{deep}");
-    let Demo { findings, tree, files } = demo_at(Path::new(&root));
-    let mut long = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(tree)));
+    let Demo { findings, scanned, files } = demo_at(Path::new(&root));
+    let mut long = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(scanned)));
     long.run();
     assert!(
         (long.get_by_label("in this folder").rect().min.y - baseline_y).abs() < 1.0,
@@ -279,9 +302,9 @@ fn deep_breadcrumb_does_not_widen_the_map_panel() {
     builder.file(&deep_dir.join("deep.bin"), 4_000_000, None);
     let index = builder.finish();
     let findings = vec![finding(&deep_dir, 4_000_000, Category::AppCache, Confidence::Safe)];
-    let tree = FolderTree::build(root, &index, &findings);
+    let tree = FolderTree::build(&index, &findings);
     let (deep_id, _) = tree.locate(&deep_dir);
-    let mut h = harness(WIDE, move |app| app.set_results(findings, 1, 0, Some(tree)));
+    let mut h = harness(WIDE, move |app| app.set_results(findings, 1, 0, Some(Scanned { index, tree })));
     h.run();
     let baseline_filter_x = h.get_by_label("Filter:").rect().min.x;
 
@@ -301,7 +324,7 @@ fn deep_breadcrumb_does_not_widen_the_map_panel() {
 #[test]
 fn ctrl_a_selects_only_visible_removable_items() {
     let _gpu = gpu();
-    let Demo { mut findings, tree, files } = demo();
+    let Demo { mut findings, scanned, files } = demo();
     findings.push(Finding {
         path: PathBuf::new(),
         size: 1_000_000,
@@ -312,7 +335,7 @@ fn ctrl_a_selects_only_visible_removable_items() {
         reason: "Installed program".into(),
         uninstall: Some("ms-settings:appsfeatures".into()),
     });
-    let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(tree)));
+    let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(scanned)));
     h.run();
     h.get_by_label("Clear").click();
     h.run();

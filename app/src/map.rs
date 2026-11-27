@@ -215,9 +215,9 @@ impl Pick {
     }
 }
 
-/// The layout of the current folder, kept until the folder, the size of the map or the sizes change.
+/// The layout of the current folder, kept until the folder, the size of the map or the tree change.
 struct MapCache {
-    key: (usize, i32, i32, u64),
+    key: (usize, i32, i32),
     cells: Vec<Cell>,
 }
 
@@ -251,6 +251,12 @@ impl Default for MapState {
 }
 
 impl MapState {
+    /// Drops what refers to cells and files of the previous tree. Folders keep their positions,
+    /// so the current one and the way back stay.
+    pub(crate) fn tree_rebuilt(&mut self) {
+        (self.picked, self.cache, self.menu) = (None, None, None);
+    }
+
     pub(crate) fn open(&mut self, folder: usize, now: f64, from: Option<egui::Rect>) {
         if folder != self.folder {
             self.back.push(self.folder);
@@ -422,7 +428,7 @@ pub(crate) fn map_view(
     let font = egui::TextStyle::Body.resolve(ui.style());
     let line = ui.text_style_height(&egui::TextStyle::Body) + 2.0;
 
-    let key = (folder, layout_area.width().round() as i32, layout_area.height().round() as i32, tree.revision());
+    let key = (folder, layout_area.width().round() as i32, layout_area.height().round() as i32);
     let cache = match state.cache.take() {
         Some(cache) if cache.key == key => cache,
         _ => {

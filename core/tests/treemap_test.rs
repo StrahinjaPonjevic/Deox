@@ -1,8 +1,10 @@
 use deox_core::report::{Category, Confidence, Finding};
 use deox_core::scan::{scan, Cancel};
-use deox_core::treemap::{squarify, FolderTree, LiveTree, Rect};
+use deox_core::treemap::{squarify, FolderTree, LiveTree, Rect, NO_EXTENSION};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn write(path: &Path, len: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -31,7 +33,7 @@ fn folder_sizes_add_up_through_the_tree() {
     write(&dir.path().join("b/three.bin"), 20);
     let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
 
-    let tree = FolderTree::build(dir.path(), &index, &[]);
+    let tree = FolderTree::build(&index, &[]);
 
     let root = tree.node(FolderTree::ROOT);
     assert_eq!(root.size, 175);
@@ -54,7 +56,7 @@ fn findings_mark_the_folders_that_contain_them() {
         finding(&dir.path().join("docs"), 30, Confidence::Info),
     ];
 
-    let tree = FolderTree::build(dir.path(), &index, &findings);
+    let tree = FolderTree::build(&index, &findings);
 
     let root = tree.node(FolderTree::ROOT);
     assert_eq!((root.safe, root.review), (40, 30), "Info findings are not counted");
@@ -73,7 +75,7 @@ fn flagged_bytes_never_exceed_the_folder_size() {
         finding(&dir.path().join("node_modules/pkg/a.bin"), 100, Confidence::Review),
     ];
 
-    let tree = FolderTree::build(dir.path(), &index, &findings);
+    let tree = FolderTree::build(&index, &findings);
 
     let root = tree.node(FolderTree::ROOT);
     assert!(root.safe + root.review <= root.size);
@@ -84,7 +86,7 @@ fn trail_runs_from_the_root_to_the_folder() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir.path().join("a/b/c.bin"), 1);
     let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
-    let tree = FolderTree::build(dir.path(), &index, &[]);
+    let tree = FolderTree::build(&index, &[]);
 
     let deepest = *tree.node(*tree.node(*tree.node(FolderTree::ROOT).children.first().unwrap()).children.first().unwrap()).parent.as_ref().unwrap();
     let names: Vec<&str> = tree.trail(deepest).iter().map(|i| tree.node(*i).name.as_str()).collect();
@@ -148,7 +150,7 @@ fn live_tree_matches_the_tree_built_after_the_scan() {
     write(&dir.path().join("b/four.bin"), 20);
     let mut live = LiveTree::new(dir.path());
     let index = scan(dir.path(), &Cancel::default(), |_, _, path, size| live.add(path, size));
-    let built = FolderTree::build(dir.path(), &index, &[]);
+    let built = FolderTree::build(&index, &[]);
 
     let live = live.tree();
     assert_eq!(live.node(FolderTree::ROOT).size, built.node(FolderTree::ROOT).size);
@@ -179,24 +181,29 @@ fn live_tree_sizes_are_usable_midway_and_files_in_alternating_folders_count_once
 fn removed_findings_leave_the_sizes_of_every_folder_above() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir.path().join("cache/x.bin"), 40);
+    write(&dir.path().join("cache/keep.bin"), 5);
     write(&dir.path().join("cache/sub/y.bin"), 10);
-    write(&dir.path().join("docs/z.bin"), 30);
-    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
-    let findings = [
-        finding(&dir.path().join("cache/x.bin"), 40, Confidence::Safe),
-        finding(&dir.path().join("cache/sub"), 10, Confidence::Safe),
-    ];
-    let mut tree = FolderTree::build(dir.path(), &index, &findings);
+    // The same name as a removed file, in another folder.
+    write(&dir.path().join("docs/x.bin"), 30);
+    let mut index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
+    let (x, sub) = (dir.path().join("cache/x.bin"), dir.path().join("cache/sub"));
 
-    tree.remove(&dir.path().join("cache/x.bin"), 40, Confidence::Safe);
-    tree.remove(&dir.path().join("cache/sub"), 10, Confidence::Safe);
+    index.remove(&HashSet::from([x.as_path(), sub.as_path()]));
+    let tree = FolderTree::build(&index, &[]);
 
+    let mut left: Vec<_> = index.files.iter().map(|f| index.file_path(f)).collect();
+    left.sort();
+    assert_eq!(left, [dir.path().join("cache/keep.bin"), dir.path().join("docs/x.bin")]);
     let root = tree.node(FolderTree::ROOT);
-    assert_eq!((root.size, root.safe), (30, 0));
+    assert_eq!((root.size, root.file_count, root.dir_count), (35, 2, 2));
     let (cache, exact) = tree.locate(&dir.path().join("cache"));
     assert!(exact);
-    assert_eq!(tree.node(cache).size, 0);
-    assert_eq!(tree.node(root.children[0]).name, "docs", "the emptied folder sorts last");
+    assert_eq!(tree.node(cache).size, 5);
+    assert_eq!(tree.node(cache).files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["keep.bin"]);
+    assert!(tree.node(cache).children.is_empty(), "the removed folder is no longer listed");
+    assert!(!tree.locate(&sub).1);
+    assert_eq!(tree.node(root.children[0]).name, "docs", "the folder that shrank sorts last");
+    assert_eq!(tree.extensions().iter().map(|e| (e.size, e.count)).collect::<Vec<_>>(), [(35, 2)]);
 }
 
 #[test]
@@ -208,7 +215,7 @@ fn layout_gives_every_listed_file_a_cell_inside_its_folder() {
     write(&dir.path().join("docs/note.txt"), 300);
     let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
     let findings = [finding(&dir.path().join("cache"), 700, Confidence::Safe)];
-    let tree = FolderTree::build(dir.path(), &index, &findings);
+    let tree = FolderTree::build(&index, &findings);
 
     let cells = layout(&tree, FolderTree::ROOT, Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 }, None, 16.0, 2.0);
 
@@ -223,21 +230,64 @@ fn layout_gives_every_listed_file_a_cell_inside_its_folder() {
 }
 
 #[test]
-fn a_removed_folder_and_a_finding_inside_it_are_taken_out_once() {
+fn a_removed_folder_takes_everything_below_it_along() {
     let dir = tempfile::tempdir().unwrap();
-    write(&dir.path().join("project/modules/dep.bin"), 100);
+    write(&dir.path().join("project/modules/deep/dep.bin"), 100);
     write(&dir.path().join("project/modules/dup.bin"), 10);
     write(&dir.path().join("keep/file.bin"), 50);
-    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
-    let mut tree = FolderTree::build(dir.path(), &index, &[]);
+    let mut index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
     let modules = dir.path().join("project/modules");
     let dup = modules.join("dup.bin");
 
-    tree.remove_all(&[(modules.as_path(), 110, Confidence::Review), (dup.as_path(), 10, Confidence::Review), (dup.as_path(), 10, Confidence::Review)]);
+    // A file listed along with the folder that holds it counts once.
+    index.remove(&HashSet::from([modules.as_path(), dup.as_path()]));
+    let tree = FolderTree::build(&index, &[]);
 
+    assert_eq!(index.files.len(), 1);
     assert_eq!(tree.node(FolderTree::ROOT).size, 50);
     let (project, _) = tree.locate(&dir.path().join("project"));
-    assert_eq!(tree.node(project).size, 0);
+    assert_eq!((tree.node(project).size, tree.node(project).dir_count, tree.node(project).newest), (0, 0, None));
+}
+
+#[test]
+fn counts_and_newest_change_cover_everything_below_a_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("a/old.bin"), 1);
+    write(&dir.path().join("a/deep/new.bin"), 1);
+    fs::create_dir(dir.path().join("a/empty")).unwrap();
+    let newest = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    for (name, time) in [("a/old.bin", UNIX_EPOCH + Duration::from_secs(1_000_000_000)), ("a/deep/new.bin", newest)] {
+        fs::File::options().write(true).open(dir.path().join(name)).unwrap().set_modified(time).unwrap();
+    }
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
+
+    let tree = FolderTree::build(&index, &[]);
+
+    let root = tree.node(FolderTree::ROOT);
+    assert_eq!((root.file_count, root.dir_count, root.newest), (2, 3, Some(newest)));
+    let (empty, exact) = tree.locate(&dir.path().join("a/empty"));
+    assert!(exact, "folders without files are part of the tree");
+    assert_eq!((tree.node(empty).file_count, tree.node(empty).newest), (0, None));
+}
+
+#[test]
+fn files_are_totalled_by_lowercase_extension_largest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("a.TXT"), 5);
+    write(&dir.path().join("sub/b.txt"), 6);
+    write(&dir.path().join("sub/movie.mkv"), 100);
+    write(&dir.path().join("README"), 2);
+    write(&dir.path().join(".gitignore"), 1);
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
+
+    let tree = FolderTree::build(&index, &[]);
+
+    let totals: Vec<(&str, u64, u64)> = tree.extensions().iter().map(|e| (&*e.extension, e.size, e.count)).collect();
+    assert_eq!(totals, [("mkv", 100, 1), ("txt", 11, 2), (NO_EXTENSION, 3, 2)]);
+    let (sub, _) = tree.locate(&dir.path().join("sub"));
+    let leaves: Vec<(&str, &str)> =
+        tree.node(sub).files.iter().map(|f| (f.name.as_str(), &*tree.extensions()[f.extension].extension)).collect();
+    assert_eq!(leaves, [("movie.mkv", "mkv"), ("b.txt", "txt")]);
 }
 
 #[test]
@@ -248,7 +298,7 @@ fn layout_inside_a_flagged_folder_keeps_the_flag_on_files_and_the_rest() {
         write(&dir.path().join(format!("cache/f{n}.bin")), 10 + n);
     }
     let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
-    let tree = FolderTree::build(dir.path(), &index, &[]);
+    let tree = FolderTree::build(&index, &[]);
     let (cache, _) = tree.locate(&dir.path().join("cache"));
 
     let cells = layout(&tree, cache, Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 }, Some(Confidence::Safe), 16.0, 1.0);

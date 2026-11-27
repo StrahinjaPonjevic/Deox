@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -29,6 +29,8 @@ pub struct DirEntry {
     pub parent: Option<u32>,
     /// Empty for the scan root, whose path is [`Index::root`].
     pub name: Box<OsStr>,
+    /// Set by [`Index::remove`]. The entry stays so that positions do not change.
+    pub removed: bool,
 }
 
 pub struct FileEntry {
@@ -85,6 +87,26 @@ impl Index {
         self.dir_path(file.dir).join(&*file.name)
     }
 
+    /// Takes out what is gone from disk. Each path is a file, or a folder with everything in it.
+    pub fn remove(&mut self, gone: &HashSet<&Path>) {
+        let paths = self.dir_paths();
+        // Parents come first, so a removed folder passes the mark down.
+        for (id, path) in paths.iter().enumerate() {
+            let inherited = self.dirs[id].parent.is_some_and(|parent| self.dirs[parent as usize].removed);
+            if inherited || gone.contains(path.as_path()) {
+                self.dirs[id].removed = true;
+            }
+        }
+        // File paths are only built in folders that held something that is gone.
+        let beside: HashSet<&Path> = gone.iter().filter_map(|path| path.parent()).collect();
+        let dirs = &self.dirs;
+        self.files.retain(|file| {
+            let id = file.dir as usize;
+            let folder = paths[id].as_path();
+            !dirs[id].removed && !(beside.contains(folder) && gone.contains(folder.join(&*file.name).as_path()))
+        });
+    }
+
     /// For each folder in [`Index::dirs`], whether it, or any folder above it, has a name starting
     /// with a dot. Tools keep their own data there: it is measured like everything else, but
     /// offered for removal only where a rule names it.
@@ -116,7 +138,7 @@ impl IndexBuilder {
     pub fn new(root: impl Into<PathBuf>) -> IndexBuilder {
         let root = root.into();
         let ids = HashMap::from([(root.clone(), 0)]);
-        let dirs = vec![DirEntry { parent: None, name: OsStr::new("").into() }];
+        let dirs = vec![DirEntry { parent: None, name: OsStr::new("").into(), removed: false }];
         IndexBuilder { index: Index { root, dirs, files: Vec::new(), errors: Vec::new(), cancelled: false }, ids }
     }
 
@@ -133,7 +155,7 @@ impl IndexBuilder {
         };
         let parent = Some(self.dir(parent));
         let id = u32::try_from(self.index.dirs.len()).expect("too many folders");
-        self.index.dirs.push(DirEntry { parent, name: name.into() });
+        self.index.dirs.push(DirEntry { parent, name: name.into(), removed: false });
         self.ids.insert(path.to_path_buf(), id);
         id
     }

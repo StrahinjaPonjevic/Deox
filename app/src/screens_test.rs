@@ -81,6 +81,13 @@ fn results_harness(size: egui::Vec2) -> Harness<'static, DeoxApp> {
     harness(size, move |app| app.set_results(findings, files, 0, Some(scanned)))
 }
 
+/// The results with the Cleanup tab open; they start in the explorer.
+fn cleanup_harness(size: egui::Vec2) -> Harness<'static, DeoxApp> {
+    let mut harness = results_harness(size);
+    harness.state_mut().tab = Tab::Cleanup;
+    harness
+}
+
 fn shot(harness: &mut Harness<'_, DeoxApp>, name: &str) {
     harness.run();
     if !pictures() {
@@ -124,22 +131,46 @@ fn scan_screen() {
 #[test]
 fn results_screen() {
     let _gpu = gpu();
-    let mut h = results_harness(WIDE);
+    let mut h = cleanup_harness(WIDE);
     shot(&mut h, "results");
     assert!(h.query_by_label("Move to Recycle Bin…").is_some());
 }
 
 #[test]
-fn narrow_window_switches_between_list_and_map() {
+fn results_open_in_the_explorer_and_the_tabs_switch_at_any_width() {
     let _gpu = gpu();
-    let mut h = results_harness(NARROW);
-    shot(&mut h, "results_narrow");
-    assert!(h.query_by_label("Filter:").is_some(), "the list is shown first");
+    for (size, name) in [(NARROW, "narrow"), (WIDE, "wide")] {
+        let mut h = results_harness(size);
+        shot(&mut h, &format!("explorer_{name}"));
+        assert!(h.query_by_label("in this folder").is_some(), "the explorer comes first");
+        assert!(h.query_by_label("Filter:").is_none());
+        assert!(h.query_by_label("Move to Recycle Bin…").is_none());
 
-    h.get_by_label("Map").click();
-    shot(&mut h, "results_narrow_map");
-    assert!(h.query_by_label("Filter:").is_none(), "the map replaces the list");
-    assert!(h.state().tab == View::Map);
+        h.get_by_label_contains("Cleanup (4 · ").click();
+        shot(&mut h, &format!("cleanup_{name}"));
+        assert!(h.query_by_label("Filter:").is_some());
+        assert!(h.query_by_label("Move to Recycle Bin…").is_some());
+        assert!(h.query_by_label("in this folder").is_none(), "the list has the whole window");
+
+        h.get_by_label("Disk Explorer").click();
+        h.run();
+        assert!(h.query_by_label("in this folder").is_some());
+    }
+}
+
+#[test]
+fn selecting_in_the_explorer_updates_the_cleanup_tab_title() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.state_mut().selected.clear();
+    h.run();
+    assert!(h.query_by_label_contains(" · 0 selected)").is_some());
+
+    h.get_by_label("Select Safe here").click();
+    h.run();
+
+    assert!(h.query_by_label_contains(" · 2 selected)").is_some());
+    assert!(h.state().tab == Tab::Explorer);
 }
 
 #[test]
@@ -170,7 +201,7 @@ fn only_safe_items_start_selected() {
 #[test]
 fn nothing_selected_disables_the_move_button() {
     let _gpu = gpu();
-    let mut h = results_harness(WIDE);
+    let mut h = cleanup_harness(WIDE);
     h.run();
     assert!(!h.get_by_label("Move to Recycle Bin…").accesskit_node().is_disabled());
 
@@ -184,7 +215,7 @@ fn nothing_selected_disables_the_move_button() {
 #[test]
 fn select_all_safe_restores_the_selection() {
     let _gpu = gpu();
-    let mut h = results_harness(WIDE);
+    let mut h = cleanup_harness(WIDE);
     h.run();
     h.get_by_label("Clear").click();
     h.run();
@@ -198,7 +229,7 @@ fn select_all_safe_restores_the_selection() {
 #[test]
 fn double_clicking_a_row_shows_it_on_the_map() {
     let _gpu = gpu();
-    let mut h = results_harness(WIDE);
+    let mut h = cleanup_harness(WIDE);
     h.run();
     assert_eq!(h.state().map.folder, FolderTree::ROOT);
 
@@ -207,6 +238,7 @@ fn double_clicking_a_row_shows_it_on_the_map() {
     h.get_by_label("Chrome").click();
     h.run();
 
+    assert!(h.state().tab == Tab::Explorer);
     assert_ne!(h.state().map.folder, FolderTree::ROOT, "the map opens the folder that holds the item");
     assert!(h.state().map.picked.is_some(), "and points out the item");
     shot(&mut h, "results_after_double_click");
@@ -237,7 +269,6 @@ fn moving_a_folder_drops_what_was_inside_it_while_the_map_shows_it() {
     findings.push(finding(&temp.join("t0.bin"), 20_000, Category::Duplicate, Confidence::Review));
     let (temp_id, _) = scanned.tree.locate(temp);
     let mut h = harness(NARROW, move |app| app.set_results(findings, files, 0, Some(scanned)));
-    h.get_by_label("Map").click();
     h.run();
     h.state_mut().map.open(temp_id, 0.0, None);
     h.run();
@@ -252,7 +283,7 @@ fn moving_a_folder_drops_what_was_inside_it_while_the_map_shows_it() {
 }
 
 #[test]
-fn a_long_folder_name_does_not_push_the_size_out_of_the_map_panel() {
+fn a_long_folder_name_does_not_push_the_size_out_of_the_window() {
     let _gpu = gpu();
     let deep = r"AppData\Local\Google\Chrome\User Data\Default\Service Worker\CacheStorage\Deeply Nested Folder Name";
     let root = format!(r"C:\Users\Some Person\{deep}\{deep}");
@@ -262,7 +293,7 @@ fn a_long_folder_name_does_not_push_the_size_out_of_the_map_panel() {
 
     let sizes: Vec<egui::Rect> = h.query_all_by_label_contains("MB").map(|n| n.rect()).filter(|r| r.min.y > 560.0).collect();
     assert!(!sizes.is_empty(), "the size under the map is shown");
-    assert!(sizes.iter().all(|r| r.max.x <= WIDE.x * 0.6), "and stays inside the map panel: {sizes:?}");
+    assert!(sizes.iter().all(|r| r.max.x <= WIDE.x), "and stays inside the window: {sizes:?}");
 }
 
 #[test]
@@ -282,6 +313,8 @@ fn long_root_breadcrumb_stays_on_one_line() {
         "a long root path should truncate instead of wrapping the breadcrumb"
     );
 
+    long.state_mut().tab = Tab::Cleanup;
+    long.run();
     long.get_by_label("Chrome").click();
     long.step();
     long.get_by_label("Chrome").click();
@@ -293,7 +326,7 @@ fn long_root_breadcrumb_stays_on_one_line() {
 }
 
 #[test]
-fn deep_breadcrumb_does_not_widen_the_map_panel() {
+fn deep_breadcrumb_stays_inside_the_window() {
     let _gpu = gpu();
     let root = Path::new(r"C:\Demo");
     let deep_rel = Path::new("level1/level2/level3/level4/level5/level6/level7/level8/level9");
@@ -306,19 +339,16 @@ fn deep_breadcrumb_does_not_widen_the_map_panel() {
     let (deep_id, _) = tree.locate(&deep_dir);
     let mut h = harness(WIDE, move |app| app.set_results(findings, 1, 0, Some(Scanned { index, tree })));
     h.run();
-    let baseline_filter_x = h.get_by_label("Filter:").rect().min.x;
 
     h.state_mut().map.open(deep_id, 0.0, None);
     h.run();
 
-    let filter_x = h.get_by_label("Filter:").rect().min.x;
-    assert!((filter_x - baseline_filter_x).abs() < 1.0, "Filter moved from {baseline_filter_x} to {filter_x}");
     let last_crumb = h
         .query_all_by_label("level9")
         .min_by_key(|n| n.rect().min.y as i32)
         .expect("level9 breadcrumb")
         .rect();
-    assert!(last_crumb.max.x < filter_x, "last breadcrumb {last_crumb:?} stays inside map panel (< {filter_x})");
+    assert!(last_crumb.max.x <= WIDE.x, "last breadcrumb {last_crumb:?} stays inside the window");
 }
 
 #[test]
@@ -335,7 +365,10 @@ fn ctrl_a_selects_only_visible_removable_items() {
         reason: "Installed program".into(),
         uninstall: Some("ms-settings:appsfeatures".into()),
     });
-    let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, Some(scanned)));
+    let mut h = harness(WIDE, move |app| {
+        app.set_results(findings, files, 0, Some(scanned));
+        app.tab = Tab::Cleanup;
+    });
     h.run();
     h.get_by_label("Clear").click();
     h.run();
@@ -371,4 +404,5 @@ fn results_without_a_map_still_show_the_list() {
     let mut h = harness(WIDE, move |app| app.set_results(findings, files, 0, None));
     shot(&mut h, "results_no_map");
     assert!(h.query_by_label("Filter:").is_some());
+    assert!(h.get_by_label("Disk Explorer").accesskit_node().is_disabled());
 }

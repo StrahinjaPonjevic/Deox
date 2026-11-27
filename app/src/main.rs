@@ -25,8 +25,6 @@ use worker::{Msg, Notifier, Scanned};
 const MAX_LISTED_SKIPS: usize = 200;
 /// Width of the centered column on the start screen.
 const START_COLUMN: f32 = 600.0;
-/// Content width from which the map and the list are shown side by side.
-const SPLIT_MIN_WIDTH: f32 = 860.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -60,6 +58,8 @@ enum Row {
 
 struct Results {
     report: Report,
+    /// The report's groups as positions in its findings, so that filtering does not sort again.
+    groups: Vec<(Category, Vec<usize>)>,
     files: u64,
     unreadable: usize,
     /// Updated after a move, so what was moved leaves the map as well.
@@ -67,11 +67,28 @@ struct Results {
 }
 
 impl Results {
+    fn new(findings: Vec<Finding>, files: u64, unreadable: usize, scanned: Option<Scanned>) -> Results {
+        let report = Report::new(findings);
+        let groups =
+            report.groups().into_iter().map(|g| (g.category, g.items.into_iter().map(|(i, _)| i).collect())).collect();
+        Results { report, groups, files, unreadable, scanned }
+    }
+
     fn tree(&self) -> Option<&FolderTree> {
         self.scanned.as_ref().map(|scanned| &scanned.tree)
     }
 }
 
+/// What the results show.
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    /// Where the space went.
+    Explorer,
+    /// What can be removed.
+    Cleanup,
+}
+
+/// How a running scan shows the folders measured so far.
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     List,
@@ -108,7 +125,7 @@ struct DeoxApp {
     filter: String,
     /// Per finding: whether it passes the current filter.
     visible: Vec<bool>,
-    tab: View,
+    tab: Tab,
     /// The folder shown in the map, as a node of the folder tree.
     map: MapState,
     /// Row highlighted for keyboard control, as a position in `rows`.
@@ -190,7 +207,7 @@ impl DeoxApp {
             move_cancel: Arc::new(Cancel::default()),
             filter: String::new(),
             visible: Vec::new(),
-            tab: View::List,
+            tab: Tab::Explorer,
             map: MapState::default(),
             cursor_row: None,
             scroll_to: None,
@@ -261,10 +278,10 @@ impl DeoxApp {
         // Only regenerating caches start selected; everything else is the user's call.
         self.selected =
             findings.iter().enumerate().filter(|(_, f)| f.confidence == Confidence::Safe).map(|(i, _)| i).collect();
-        self.results = Some(Results { report: Report::new(findings), files, unreadable, scanned });
+        self.tab = if scanned.is_some() { Tab::Explorer } else { Tab::Cleanup };
+        self.results = Some(Results::new(findings, files, unreadable, scanned));
         // A long list of duplicates would push everything else off screen; the user opens it on purpose.
         self.collapsed.insert(Category::Duplicate);
-        self.tab = View::List;
         self.map = MapState::default();
         self.reveal_start = self.ctx.input(|i| i.time);
         self.rebuild_rows();
@@ -275,18 +292,18 @@ impl DeoxApp {
         let Some(results) = &self.results else { return };
         let needle = self.filter.trim().to_lowercase();
         self.visible = results.report.findings.iter().map(|f| matches_filter(f, &needle)).collect();
-        for group in results.report.groups() {
-            let shown: Vec<(usize, &Finding)> = group.items.iter().filter(|(i, _)| self.visible[*i]).copied().collect();
+        for (category, items) in &results.groups {
+            let shown: Vec<usize> = items.iter().copied().filter(|i| self.visible[*i]).collect();
             if shown.is_empty() {
                 continue;
             }
             self.rows.push(Row::Header {
-                category: group.category,
-                total: shown.iter().map(|(_, f)| f.size).sum(),
+                category: *category,
+                total: shown.iter().map(|i| results.report.findings[*i].size).sum(),
                 count: shown.len(),
             });
-            if !self.collapsed.contains(&group.category) {
-                self.rows.extend(shown.iter().map(|(i, _)| Row::Item(*i)));
+            if !self.collapsed.contains(category) {
+                self.rows.extend(shown.into_iter().map(Row::Item));
             }
         }
         self.cursor_row = self.cursor_row.filter(|c| *c < self.rows.len());
@@ -393,7 +410,7 @@ impl DeoxApp {
             *tree = FolderTree::build(index, &findings);
         }
         self.map.tree_rebuilt();
-        self.results = Some(Results { report: Report::new(findings), ..results });
+        self.results = Some(Results::new(findings, results.files, results.unreadable, results.scanned));
         self.rebuild_rows();
     }
 
@@ -591,6 +608,38 @@ impl DeoxApp {
 
     fn results_screen(&mut self, ui: &mut egui::Ui) {
         let Some(results) = &self.results else { return };
+        let (count, size) = removable(&results.report);
+        let has_tree = results.tree().is_some();
+        // The count of selected items stays in view, also while they are picked in the explorer.
+        let cleanup = format!("Cleanup ({count} · {} · {} selected)", human(size), self.selected.len());
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(has_tree, |ui| {
+                ui.selectable_value(&mut self.tab, Tab::Explorer, RichText::new("Disk Explorer").size(16.0));
+            })
+            .response
+            .on_disabled_hover_text("The explorer is not available for this scan.");
+            ui.selectable_value(&mut self.tab, Tab::Cleanup, RichText::new(cleanup).size(16.0));
+        });
+        ui.separator();
+        match self.tab {
+            Tab::Explorer => self.explorer_tab(ui),
+            Tab::Cleanup => self.cleanup_tab(ui),
+        }
+    }
+
+    fn explorer_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(results) = &self.results else { return };
+        let Some(tree) = results.tree() else { return };
+        scan_notes(ui, results);
+        ui.add_space(4.0);
+        let dark = ui.visuals().dark_mode;
+        if let Some(action) = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected) {
+            self.apply_map_action(action);
+        }
+    }
+
+    fn cleanup_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(results) = &self.results else { return };
         let (removable_count, removable_size) = removable(&results.report);
         if removable_count == 0 {
             ui.label(format!("Scanned {} files. System folders such as Windows and Program Files are skipped.", results.files));
@@ -651,49 +700,10 @@ impl DeoxApp {
             }
         }
         ui.separator();
-
-        // Wide windows show the map beside the list; narrow ones switch between them.
-        let split = results.tree().is_some() && ui.available_width() >= SPLIT_MIN_WIDTH;
-        if split && self.tab == View::Map {
-            self.tab = View::List;
-        }
-        let mut map_action = None;
-        if split {
-            if removable_count > 0 {
-                scan_notes(ui, results);
-            }
-            if let Some(tree) = results.tree() {
-                let dark = ui.visuals().dark_mode;
-                let width = ui.available_width() * 0.55;
-                egui::Panel::left("map_panel").resizable(true).default_size(width).size_range(320.0..=width * 1.4).show(ui, |ui| {
-                    map_action = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected);
-                });
-            }
-        } else {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, View::List, "List");
-                ui.add_enabled_ui(results.tree().is_some(), |ui| {
-                    ui.selectable_value(&mut self.tab, View::Map, "Map");
-                })
-                .response
-                .on_disabled_hover_text("The map is not available for this scan.");
-            });
-        }
-        if removable_count > 0 && !split && self.tab == View::List {
+        if removable_count > 0 {
             scan_notes(ui, results);
         }
-
-        if let (View::Map, Some(tree)) = (self.tab, results.tree()) {
-            let dark = ui.visuals().dark_mode;
-            if let Some(action) = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected) {
-                self.apply_map_action(action);
-            }
-            return;
-        }
         self.results_list(ui, removable_size);
-        if let Some(action) = map_action {
-            self.apply_map_action(action);
-        }
     }
 
     fn results_list(&mut self, ui: &mut egui::Ui, removable_size: u64) {
@@ -820,7 +830,7 @@ impl DeoxApp {
                         // The reason sits on hover so every row stays one line.
                         let mut hover = if full_path.is_empty() { finding.reason.clone() } else { format!("{full_path}\n{}", finding.reason) };
                         if can_locate {
-                            hover.push_str("\nDouble-click to show on the map.");
+                            hover.push_str("\nDouble-click to show in Disk Explorer.");
                         }
                         if row.clicked() {
                             clicked_row = Some(pos);
@@ -970,7 +980,7 @@ impl DeoxApp {
         let now = self.ctx.input(|i| i.time);
         self.map.open(folder, now, None);
         self.map.picked = pick;
-        self.tab = View::Map;
+        self.tab = Tab::Explorer;
     }
 
     fn apply_map_action(&mut self, action: MapAction) {
@@ -978,7 +988,7 @@ impl DeoxApp {
         match action {
             MapAction::ShowInList(path) => {
                 self.filter = path;
-                self.tab = View::List;
+                self.tab = Tab::Cleanup;
                 self.rebuild_rows();
             }
             MapAction::SelectSafe(path) => {

@@ -189,7 +189,7 @@ pub(crate) fn live_map_view(ui: &mut egui::Ui, live: Option<&Arc<Mutex<LiveTree>
 
 /// What the user asked for in the map besides browsing it.
 pub(crate) enum MapAction {
-    /// Show the items under this folder in the list.
+    /// Show the items under this folder in the Cleanup tab.
     ShowInList(String),
     /// Select every Safe item under this folder.
     SelectSafe(PathBuf),
@@ -513,7 +513,7 @@ pub(crate) fn map_view(
             enter = Some((target, pick, rect));
             ui.close();
         }
-        if ui.button("Show in list").clicked() {
+        if ui.button("Show in Cleanup").clicked() {
             action = Some(MapAction::ShowInList(cell_path(tree, kind).display().to_string()));
             ui.close();
         }
@@ -582,7 +582,7 @@ pub(crate) fn map_view(
     let detail = format!("{detail} {} selected.", items(here));
     ui.add(egui::Label::new(RichText::new(&detail).weak()).truncate()).on_hover_text(detail);
     ui.horizontal(|ui| {
-        if ui.button("Show in list").on_hover_text("Lists the suggested items here.").clicked() {
+        if ui.button("Show in Cleanup").on_hover_text("Lists the suggested items here.").clicked() {
             action = Some(MapAction::ShowInList(focus_path.display().to_string()));
         }
         if ui.button("Select Safe here").on_hover_text("Selects every Safe item here. Nothing moves until you confirm.").clicked() {

@@ -1,5 +1,7 @@
 use deox_core::scan::{scan, walk, Cancel};
+use std::ffi::OsString;
 use std::fs;
+use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -15,7 +17,7 @@ fn counts_files_and_sizes_exactly() {
     write(&dir.path().join("sub/b.txt"), 10);
     write(&dir.path().join("sub/deep/c.txt"), 0);
 
-    let index = scan(dir.path(), &Cancel::default(), |_, _, _| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
 
     assert_eq!(index.files.len(), 3);
     assert_eq!(index.files.iter().map(|f| f.size).sum::<u64>(), 13);
@@ -40,10 +42,35 @@ fn does_not_follow_junctions() {
         .status;
     assert!(status.success(), "junction could not be created");
 
-    let index = scan(&root, &Cancel::default(), |_, _, _| {});
+    let index = scan(&root, &Cancel::default(), |_, _, _, _| {});
 
     assert_eq!(index.files.len(), 1);
-    assert!(index.files[0].path.ends_with("own.txt"));
+    assert!(index.file_path(&index.files[0]).ends_with("own.txt"));
+}
+
+#[test]
+fn paths_are_rebuilt_exactly_from_the_folder_table() {
+    let dir = tempfile::tempdir().unwrap();
+    // An unpaired surrogate is a legal Windows name but not valid Unicode.
+    let odd = OsString::from_wide(&[u16::from(b'x'), 0xD800]);
+    let mut expected = vec![dir.path().join("a.txt"), dir.path().join("sub/deep/b.txt"), dir.path().join("sub").join(odd)];
+    for path in &expected {
+        write(path, 1);
+    }
+    fs::create_dir(dir.path().join("empty")).unwrap();
+
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
+
+    let mut found: Vec<_> = index.files.iter().map(|f| index.file_path(f)).collect();
+    found.sort();
+    expected.sort();
+    assert_eq!(found, expected);
+
+    // Root, `sub`, `sub/deep` and `empty`, each after its parent.
+    assert_eq!(index.dirs.len(), 4);
+    assert!(index.dirs.iter().enumerate().skip(1).all(|(id, d)| d.parent.is_some_and(|p| (p as usize) < id)));
+    let paths = index.dir_paths();
+    assert!((0..index.dirs.len()).all(|id| paths[id] == index.dir_path(id as u32) && paths[id].is_dir()));
 }
 
 /// Denies listing a directory for the lifetime of the guard.
@@ -71,7 +98,7 @@ fn inaccessible_folder_is_recorded_not_fatal() {
     write(&locked.join("hidden.txt"), 1);
     let _guard = Denied::new(&locked);
 
-    let index = scan(dir.path(), &Cancel::default(), |_, _, _| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
 
     assert_eq!(index.files.len(), 1);
     assert_eq!(index.errors.len(), 1);
@@ -82,7 +109,7 @@ fn inaccessible_folder_is_recorded_not_fatal() {
 fn missing_root_is_an_error_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
 
-    let index = scan(&dir.path().join("nope"), &Cancel::default(), |_, _, _| {});
+    let index = scan(&dir.path().join("nope"), &Cancel::default(), |_, _, _, _| {});
 
     assert!(index.files.is_empty());
     assert_eq!(index.errors.len(), 1);
@@ -96,7 +123,7 @@ fn cancel_stops_the_scan() {
     }
     let cancel = Cancel::default();
 
-    let index = scan(dir.path(), &cancel, |seen, _, _| {
+    let index = scan(dir.path(), &cancel, |seen, _, _, _| {
         if seen == 5 {
             cancel.cancel();
         }
@@ -114,11 +141,11 @@ fn skipped_folders_are_not_entered_but_the_root_is_always_scanned() {
     write(&dir.path().join("other/b.txt"), 1);
     let skip_named = |p: &Path| p.file_name().is_some_and(|n| n == "skipme");
 
-    let index = walk(dir.path(), &Cancel::default(), |_, _, _| {}, |_| {}, skip_named);
+    let index = walk(dir.path(), &Cancel::default(), |_, _, _, _| {}, |_| {}, skip_named);
     assert_eq!(index.files.len(), 2);
-    assert!(index.files.iter().all(|f| !f.path.to_string_lossy().contains("skipme")));
+    assert!(index.files.iter().all(|f| !index.file_path(f).to_string_lossy().contains("skipme")));
 
-    let index = walk(&dir.path().join("skipme"), &Cancel::default(), |_, _, _| {}, |_| {}, skip_named);
+    let index = walk(&dir.path().join("skipme"), &Cancel::default(), |_, _, _, _| {}, |_| {}, skip_named);
     assert_eq!(index.files.len(), 1);
 }
 
@@ -130,7 +157,7 @@ fn progress_reports_every_file_and_its_size() {
     }
     let mut last = (0, 0);
 
-    scan(dir.path(), &Cancel::default(), |seen, bytes, _| last = (seen, bytes));
+    scan(dir.path(), &Cancel::default(), |seen, bytes, _, _| last = (seen, bytes));
 
     assert_eq!(last, (4, 40));
 }

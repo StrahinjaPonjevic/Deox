@@ -2,7 +2,7 @@
 //! under `target/screens`, which needs a GPU adapter; without it the tests run headless.
 
 use super::*;
-use deox_core::scan::{FileEntry, Index};
+use deox_core::scan::IndexBuilder;
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::{wgpu::WgpuTestRenderer, Harness};
 use std::fs;
@@ -28,15 +28,15 @@ struct Demo {
 }
 
 fn demo_at(root: &Path) -> Demo {
-    let mut files = Vec::new();
+    let mut builder = IndexBuilder::new(root);
     for i in 0..40u64 {
         for (name, base, step) in
             [("Temp/t", 20_000, 3_000), ("Cache/Chrome/c", 60_000, 9_000), ("Projects/app/node_modules/m", 15_000, 2_000), ("Downloads/d", 90_000, 20_000)]
         {
-            files.push(FileEntry { path: root.join(format!("{name}{i}.bin")), size: base + i * step, modified: None, accessed: None });
+            builder.file(&root.join(format!("{name}{i}.bin")), base + i * step, None);
         }
     }
-    let index = Index { files, ..Default::default() };
+    let index = builder.finish();
     let findings = vec![
         finding(&root.join("Temp"), 2_000_000, Category::Temp, Confidence::Safe),
         finding(&root.join("Cache/Chrome"), 4_000_000, Category::AppCache, Confidence::Safe),
@@ -275,10 +275,9 @@ fn deep_breadcrumb_does_not_widen_the_map_panel() {
     let root = Path::new(r"C:\Demo");
     let deep_rel = Path::new("level1/level2/level3/level4/level5/level6/level7/level8/level9");
     let deep_dir = root.join(deep_rel);
-    let index = Index {
-        files: vec![FileEntry { path: deep_dir.join("deep.bin"), size: 4_000_000, modified: None, accessed: None }],
-        ..Default::default()
-    };
+    let mut builder = IndexBuilder::new(root);
+    builder.file(&deep_dir.join("deep.bin"), 4_000_000, None);
+    let index = builder.finish();
     let findings = vec![finding(&deep_dir, 4_000_000, Category::AppCache, Confidence::Safe)];
     let tree = FolderTree::build(root, &index, &findings);
     let (deep_id, _) = tree.locate(&deep_dir);

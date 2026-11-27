@@ -2,7 +2,7 @@ use deox_core::delete::delete;
 use deox_core::orphans::{find_orphaned_appdata_in, running_processes, RunningProcesses, MIN_ORPHAN_SIZE};
 use deox_core::programs::Program;
 use deox_core::report::{Category, Confidence, Finding};
-use deox_core::scan::{FileEntry, Index};
+use deox_core::scan::{Index, IndexBuilder};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,8 +18,19 @@ fn days_ago(days: u64) -> Option<SystemTime> {
     Some(now() - Duration::from_secs(days * DAY))
 }
 
-fn file(path: impl Into<PathBuf>, size: u64, age_days: u64) -> FileEntry {
-    FileEntry { path: path.into(), size, modified: days_ago(age_days), accessed: None }
+/// Path, size and age in days.
+type File = (PathBuf, u64, u64);
+
+fn file(path: impl Into<PathBuf>, size: u64, age_days: u64) -> File {
+    (path.into(), size, age_days)
+}
+
+fn index(root: &Path, files: Vec<File>) -> Index {
+    let mut builder = IndexBuilder::new(root);
+    for (path, size, age_days) in files {
+        builder.file(&path, size, days_ago(age_days));
+    }
+    builder.finish()
 }
 
 fn program(name: &str) -> Program {
@@ -36,20 +47,18 @@ fn program(name: &str) -> Program {
 #[test]
 fn unmatched_old_appdata_folder_is_a_review_finding() {
     let local = PathBuf::from(r"C:\Users\Alice\AppData\Local");
-    let idx = Index {
-        files: vec![
-            file(local.join(r"OldTool\cache.bin"), MIN_ORPHAN_SIZE, 120),
-            // Bare file directly in LocalAppData is not a folder.
-            file(local.join("loose.dat"), MIN_ORPHAN_SIZE * 2, 120),
-        ],
-        ..Index::default()
-    };
+    let idx = index(Path::new(r"C:\"), vec![
+        file(local.join(r"OldTool\cache.bin"), MIN_ORPHAN_SIZE, 120),
+        file(local.join(r"OldTool\logs\old\a.log"), 1, 200),
+        // Bare file directly in LocalAppData is not a folder.
+        file(local.join("loose.dat"), MIN_ORPHAN_SIZE * 2, 120),
+    ]);
 
     let findings = find_orphaned_appdata_in(&local, &idx, &local, &[], &RunningProcesses::default(), &[], &[], now());
 
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].path, local.join("OldTool"));
-    assert_eq!(findings[0].size, MIN_ORPHAN_SIZE);
+    assert_eq!(findings[0].size, MIN_ORPHAN_SIZE + 1);
     assert_eq!(findings[0].category, Category::OrphanedAppData);
     assert_eq!(findings[0].confidence, Confidence::Review);
     assert!(findings[0].modified.is_none());
@@ -79,18 +88,15 @@ fn folders_matching_installed_programs_or_install_dirs_are_skipped() {
         by_loc,
         by_uninstall,
     ];
-    let idx = Index {
-        files: vec![
-            file(local.join(r"7zip\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"Code\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"JetBrains\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"My Vendor Dir\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"Space Tool\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"CoolApp\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"TrulyOrphaned\data.bin"), MIN_ORPHAN_SIZE, 200),
-        ],
-        ..Index::default()
-    };
+    let idx = index(Path::new(r"C:\"), vec![
+        file(local.join(r"7zip\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"Code\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"JetBrains\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"My Vendor Dir\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"Space Tool\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"CoolApp\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"TrulyOrphaned\data.bin"), MIN_ORPHAN_SIZE, 200),
+    ]);
 
     let findings = find_orphaned_appdata_in(
         Path::new(r"C:\"),
@@ -124,21 +130,18 @@ fn active_process_recent_change_small_reserved_and_covered_folders_are_skipped()
         reason: "test".into(),
         uninstall: None,
     };
-    let idx = Index {
-        files: vec![
-            file(local.join(r"PortableTool\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"CustomDir\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"RecentApp\data.bin"), MIN_ORPHAN_SIZE, 10),
-            file(local.join(r"TinyApp\data.bin"), MIN_ORPHAN_SIZE - 1, 200),
-            file(local.join(r"Microsoft\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"Packages\data.bin"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"Deox\actions.log"), MIN_ORPHAN_SIZE, 200),
-            file(local.join(r"AlreadyFlagged\cache.bin"), MIN_ORPHAN_SIZE, 200),
-            // Case difference in scanned path still works.
-            file(PathBuf::from(r"c:\users\alice\appdata\local\Leftover\old.bin"), MIN_ORPHAN_SIZE, 150),
-        ],
-        ..Index::default()
-    };
+    let idx = index(Path::new(r"C:\"), vec![
+        file(local.join(r"PortableTool\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"CustomDir\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"RecentApp\data.bin"), MIN_ORPHAN_SIZE, 10),
+        file(local.join(r"TinyApp\data.bin"), MIN_ORPHAN_SIZE - 1, 200),
+        file(local.join(r"Microsoft\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"Packages\data.bin"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"Deox\actions.log"), MIN_ORPHAN_SIZE, 200),
+        file(local.join(r"AlreadyFlagged\cache.bin"), MIN_ORPHAN_SIZE, 200),
+        // Case difference in scanned path still works.
+        file(PathBuf::from(r"c:\users\alice\appdata\local\Leftover\old.bin"), MIN_ORPHAN_SIZE, 150),
+    ]);
 
     let findings = find_orphaned_appdata_in(&local, &idx, &local, &[], &processes, &[], &[covered], now());
 
@@ -149,10 +152,7 @@ fn active_process_recent_change_small_reserved_and_covered_folders_are_skipped()
 #[test]
 fn scanning_a_subfolder_inside_local_appdata_returns_no_orphan_findings() {
     let local = PathBuf::from(r"C:\Users\Alice\AppData\Local");
-    let idx = Index {
-        files: vec![file(local.join(r"OldTool\cache\blob.bin"), MIN_ORPHAN_SIZE, 200)],
-        ..Index::default()
-    };
+    let idx = index(Path::new(r"C:\"), vec![file(local.join(r"OldTool\cache\blob.bin"), MIN_ORPHAN_SIZE, 200)]);
 
     // Parent scan (including different casing) reports the orphan; subfolder scans do not.
     assert_eq!(
@@ -177,10 +177,7 @@ fn orphaned_folder_finding_passes_delete_dry_run() {
     fs::create_dir_all(&orphan).unwrap();
     fs::write(orphan.join("blob.bin"), vec![b'a'; MIN_ORPHAN_SIZE as usize]).unwrap();
 
-    let idx = Index {
-        files: vec![file(orphan.join("blob.bin"), MIN_ORPHAN_SIZE, 180)],
-        ..Index::default()
-    };
+    let idx = index(dir.path(), vec![file(orphan.join("blob.bin"), MIN_ORPHAN_SIZE, 180)]);
     let findings = find_orphaned_appdata_in(&local, &idx, &local, &[], &RunningProcesses::default(), &[], &[], now());
     assert_eq!(findings.len(), 1);
 

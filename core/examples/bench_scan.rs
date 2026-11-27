@@ -9,9 +9,8 @@ use deox_core::dupes::find_duplicates;
 use deox_core::orphans::find_orphaned_appdata;
 use deox_core::programs::{installed_programs, AppxRegistry, WindowsRegistry};
 use deox_core::rules::Rules;
-use deox_core::scan::{scan, Cancel, FileEntry, Index};
+use deox_core::scan::{scan, Cancel, DirEntry, FileEntry, Index};
 use deox_core::treemap::{FolderTree, LiveTree};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
@@ -33,16 +32,19 @@ fn total_size(index: &Index) -> u64 {
 fn scan_live(root: &Path) -> (Index, f64) {
     let live = Mutex::new(LiveTree::new(root));
     let (index, seconds) = timed(|| {
-        scan(root, &Cancel::default(), |_, _, file| live.lock().unwrap().add(&file.path, file.size))
+        scan(root, &Cancel::default(), |_, _, path, size| live.lock().unwrap().add(path, size))
     });
     let live = live.into_inner().unwrap();
     assert_eq!(live.tree().node(FolderTree::ROOT).size, total_size(&index), "live tree lost files");
     (index, seconds)
 }
 
-/// Heap held by the file list; error entries are not counted.
+/// Heap held by the folder and file lists, without allocator overhead; error entries are not counted.
 fn index_bytes(index: &Index) -> usize {
-    index.files.capacity() * size_of::<FileEntry>() + index.files.iter().map(|f| f.path.capacity()).sum::<usize>()
+    index.dirs.capacity() * size_of::<DirEntry>()
+        + index.dirs.iter().map(|d| d.name.len()).sum::<usize>()
+        + index.files.capacity() * size_of::<FileEntry>()
+        + index.files.iter().map(|f| f.name.len()).sum::<usize>()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,12 +63,10 @@ fn main() -> anyhow::Result<()> {
     // Reported apart from the runs: the disk cache is usually cold here.
     let (index, seconds) = scan_live(&root);
     println!("first scan: {seconds:.2} s");
-    let folders: HashSet<&Path> =
-        index.files.iter().flat_map(|f| f.path.ancestors().skip(1).take_while(|a| a.starts_with(&root))).collect();
     println!(
-        "{} files in {} folders (folders holding no files are not counted), {:.2} GiB, {} unreadable",
+        "{} files, {} folders, {:.2} GiB, {} unreadable",
         index.files.len(),
-        folders.len(),
+        index.dirs.len(),
         total_size(&index) as f64 / (1u64 << 30) as f64,
         index.errors.len(),
     );
@@ -75,13 +75,12 @@ fn main() -> anyhow::Result<()> {
         index_bytes(&index) as f64 / (1u64 << 20) as f64,
         index_bytes(&index) / index.files.len().max(1),
     );
-    drop(folders);
     drop(index);
 
     let rules = Rules::builtin()?;
     for run in 1..=runs {
         println!("run {run}");
-        let (index, plain) = timed(|| scan(&root, &Cancel::default(), |_, _, _| {}));
+        let (index, plain) = timed(|| scan(&root, &Cancel::default(), |_, _, _, _| {}));
         println!("  scan, no live tree    {plain:8.2} s");
         drop(index);
         let (index, live) = scan_live(&root);

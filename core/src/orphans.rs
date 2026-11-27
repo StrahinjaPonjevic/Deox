@@ -103,11 +103,17 @@ pub fn find_orphaned_appdata_in(
         return Vec::new();
     }
 
-    let mut folders: HashMap<String, (PathBuf, u64, Option<SystemTime>)> = HashMap::new();
+    // Resolved once per folder, since all of its files share the answer. The joined `_` stands in
+    // for a file name: `top_folder_under` takes the path of a file.
+    let tops: Vec<Option<(String, PathBuf)>> = index
+        .dir_paths()
+        .iter()
+        .map(|dir| top_folder_under(&dir.join("_"), &base_parts).map(|(name, path)| (name.to_lowercase(), path)))
+        .collect();
+    let mut folders: HashMap<&str, (&Path, u64, Option<SystemTime>)> = HashMap::new();
     for file in &index.files {
-        let Some((name, path)) = top_folder_under(&file.path, &base_parts) else { continue };
-        let key = name.to_lowercase();
-        let entry = folders.entry(key).or_insert_with(|| (path, 0, None));
+        let Some((key, path)) = &tops[file.dir as usize] else { continue };
+        let entry = folders.entry(key).or_insert((path, 0, None));
         entry.1 += file.size;
         entry.2 = entry.2.max(file.modified);
     }
@@ -124,7 +130,7 @@ pub fn find_orphaned_appdata_in(
 
     let mut findings = Vec::new();
     for (key, (path, size, newest)) in folders {
-        if size < MIN_ORPHAN_SIZE || covered.contains(&key) {
+        if size < MIN_ORPHAN_SIZE || covered.contains(key) {
             continue;
         }
         let Some(age) = newest.and_then(|m| now.duration_since(m).ok()) else { continue };
@@ -132,16 +138,16 @@ pub fn find_orphaned_appdata_in(
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        if is_reserved_appdata_dir(name) || is_protected(&path) {
+        if is_reserved_appdata_dir(name) || is_protected(path) {
             continue;
         }
-        if matches_installed(name, programs, &installed_dirs) || matches_running(name, &path, processes) {
+        if matches_installed(name, programs, &installed_dirs) || matches_running(name, path, processes) {
             continue;
         }
 
         let days = age.as_secs() / SECS_PER_DAY;
         findings.push(Finding {
-            path,
+            path: path.to_path_buf(),
             size,
             modified: None,
             category: Category::OrphanedAppData,

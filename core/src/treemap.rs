@@ -66,13 +66,17 @@ impl FolderTree {
                 Confidence::Info => {}
             }
         }
+        let dirs = index.dir_paths();
+        // A folder gets a node only once a file shows up in it or below it.
+        let mut node_of: Vec<Option<usize>> = vec![None; dirs.len()];
         for file in &index.files {
-            let Some(dir) = file.path.parent() else { continue };
-            let id = ensure_folder(nodes, &mut lookup, root, dir);
+            let dir = file.dir as usize;
+            let id = *node_of[dir].get_or_insert_with(|| ensure_folder(nodes, &mut lookup, root, &dirs[dir]));
             nodes[id].files_size += file.size;
-            let name = file.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = file.name.to_string_lossy().into_owned();
+            let flag = flags.get(dirs[dir].join(&*file.name).as_path()).copied();
             let files = &mut nodes[id].files;
-            files.push(FileLeaf { name, size: file.size, flag: flags.get(file.path.as_path()).copied() });
+            files.push(FileLeaf { name, size: file.size, flag });
             if files.len() >= FILES_PER_FOLDER * 2 {
                 files.sort_by_key(|f| std::cmp::Reverse(f.size));
                 files.truncate(FILES_PER_FOLDER);

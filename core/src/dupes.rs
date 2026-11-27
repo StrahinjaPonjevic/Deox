@@ -52,19 +52,19 @@ pub fn find_duplicates(
     }
     let candidates: Vec<&FileEntry> = by_size.into_values().filter(|g| g.len() > 1).flatten().collect();
 
-    let partial = hash_groups(candidates, Some(PARTIAL_BYTES), cancel, &errors, &Stage::new("Comparing file beginnings", progress));
+    let partial = hash_groups(index, candidates, Some(PARTIAL_BYTES),cancel, &errors, &Stage::new("Comparing file beginnings", progress));
     // Hard links share their content, so they are collapsed before the costly full read.
     let stage = Stage::new("Checking for hard links", progress);
     stage.total.store(partial.iter().map(|g| g.len() as u64).sum(), Ordering::Relaxed);
     let distinct: Vec<&FileEntry> =
-        partial.into_par_iter().flat_map_iter(|g| distinct_on_disk(g, cancel, &errors, &stage)).collect();
-    let full = hash_groups(distinct, None, cancel, &errors, &Stage::new("Comparing whole files", progress));
+        partial.into_par_iter().flat_map_iter(|g| distinct_on_disk(index, g, cancel, &errors, &stage)).collect();
+    let full = hash_groups(index, distinct, None,cancel, &errors, &Stage::new("Comparing whole files", progress));
 
     let errors = errors.into_inner().unwrap_or_default();
     if cancel.is_cancelled() {
         return Duplicates { groups: Vec::new(), errors, cancelled: true };
     }
-    Duplicates { groups: full.into_iter().map(group).collect(), errors, cancelled: false }
+    Duplicates { groups: full.into_iter().map(|g| group(index, g)).collect(), errors, cancelled: false }
 }
 
 /// Progress of one phase, reported every few hundred files.
@@ -112,18 +112,17 @@ impl DupeGroup {
 
 /// Orders a group so the copy to keep comes first: a protected copy (it can never be
 /// deleted anyway), otherwise the oldest.
-fn group(files: Vec<&FileEntry>) -> DupeGroup {
+fn group(index: &Index, files: Vec<&FileEntry>) -> DupeGroup {
     let size = files[0].size;
-    let mut files = files;
+    let mut files: Vec<DupeFile> =
+        files.into_iter().map(|f| DupeFile { path: index.file_path(f), modified: f.modified }).collect();
     files.sort_by_cached_key(|f| (!is_protected(&f.path), f.modified, f.path.clone()));
-    DupeGroup {
-        size,
-        files: files.into_iter().map(|f| DupeFile { path: f.path.clone(), modified: f.modified }).collect(),
-    }
+    DupeGroup { size, files }
 }
 
 /// Hashes files in parallel and keeps only the groups that still hold two or more.
 fn hash_groups<'a>(
+    index: &Index,
     files: Vec<&'a FileEntry>,
     limit: Option<u64>,
     cancel: &Cancel,
@@ -137,12 +136,13 @@ fn hash_groups<'a>(
             if cancel.is_cancelled() {
                 return None;
             }
-            let result = hash_file(&file.path, limit);
+            let path = index.file_path(file);
+            let result = hash_file(&path, limit);
             stage.tick();
             match result {
                 Ok(hash) => Some(((file.size, hash), file)),
                 Err(e) => {
-                    record(errors, &file.path, &e);
+                    record(errors, &path, &e);
                     None
                 }
             }
@@ -158,6 +158,7 @@ fn hash_groups<'a>(
 /// Drops files that are the same on-disk file as one already seen (hard links).
 /// Returns nothing if fewer than two distinct files remain.
 fn distinct_on_disk<'a>(
+    index: &Index,
     files: Vec<&'a FileEntry>,
     cancel: &Cancel,
     errors: &Mutex<Vec<ScanError>>,
@@ -171,10 +172,11 @@ fn distinct_on_disk<'a>(
             if cancel.is_cancelled() {
                 return false;
             }
-            match Handle::from_path(&file.path) {
+            let path = index.file_path(file);
+            match Handle::from_path(&path) {
                 Ok(handle) => seen.insert(handle),
                 Err(e) => {
-                    record(errors, &file.path, &e);
+                    record(errors, &path, &e);
                     false
                 }
             }

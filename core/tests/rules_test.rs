@@ -1,6 +1,6 @@
 use deox_core::report::{Category, Confidence};
 use deox_core::rules::Rules;
-use deox_core::scan::{FileEntry, Index};
+use deox_core::scan::{Index, IndexBuilder};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -14,12 +14,19 @@ fn days_ago(days: u64) -> Option<SystemTime> {
     Some(now() - Duration::from_secs(days * DAY))
 }
 
-fn file(path: impl Into<PathBuf>, size: u64, age_days: u64) -> FileEntry {
-    FileEntry { path: path.into(), size, modified: days_ago(age_days), accessed: None }
+/// Path, size and age in days.
+type File = (PathBuf, u64, u64);
+
+fn file(path: impl Into<PathBuf>, size: u64, age_days: u64) -> File {
+    (path.into(), size, age_days)
 }
 
-fn index(files: Vec<FileEntry>) -> Index {
-    Index { files, ..Index::default() }
+fn index(files: Vec<File>) -> Index {
+    let mut builder = IndexBuilder::new(r"C:\");
+    for (path, size, age_days) in files {
+        builder.file(&path, size, days_ago(age_days));
+    }
+    builder.finish()
 }
 
 fn env(name: &str) -> PathBuf {
@@ -68,6 +75,19 @@ fn inactive_node_modules_is_one_review_finding() {
     assert_eq!(findings[0].size, 150);
     assert_eq!(findings[0].category, Category::DevArtifact);
     assert_eq!(findings[0].confidence, Confidence::Review);
+}
+
+#[test]
+fn scan_starting_at_or_inside_node_modules_offers_no_folder() {
+    let rules = Rules::builtin().unwrap();
+    let package = PathBuf::from(r"C:\Dev\proj\node_modules\a");
+    for root in [package.parent().unwrap(), package.as_path()] {
+        let mut builder = IndexBuilder::new(root);
+        builder.file(&package.join("index.js"), 100, days_ago(200));
+        builder.file(&package.join(r"node_modules\b\x.js"), 50, days_ago(200));
+
+        assert!(rules.evaluate(&builder.finish(), now()).is_empty(), "{}", root.display());
+    }
 }
 
 #[test]

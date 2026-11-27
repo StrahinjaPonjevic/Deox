@@ -11,7 +11,7 @@ fn write(path: &Path, content: &[u8]) {
 
 fn find(dir: &Path) -> Duplicates {
     let cancel = Cancel::default();
-    find_duplicates(&scan(dir, &cancel, |_, _, _| {}), &cancel, 1, &|_, _, _| {})
+    find_duplicates(&scan(dir, &cancel, |_, _, _, _| {}), &cancel, 1, &|_, _, _| {})
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn unreadable_file_is_reported_not_fatal() {
     write(&dir.path().join("b"), b"data");
     write(&dir.path().join("c"), b"data");
     let cancel = Cancel::default();
-    let index = scan(dir.path(), &cancel, |_, _, _| {});
+    let index = scan(dir.path(), &cancel, |_, _, _, _| {});
     fs::remove_file(dir.path().join("c")).unwrap();
 
     let dupes = find_duplicates(&index, &cancel, 1, &|_, _, _| {});
@@ -113,7 +113,7 @@ fn cancelled_search_returns_no_groups() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir.path().join("a"), b"data");
     write(&dir.path().join("b"), b"data");
-    let index = scan(dir.path(), &Cancel::default(), |_, _, _| {});
+    let index = scan(dir.path(), &Cancel::default(), |_, _, _, _| {});
     let cancel = Cancel::default();
     cancel.cancel();
 
@@ -131,7 +131,7 @@ fn files_below_the_minimum_size_are_ignored() {
     write(&dir.path().join("big_a"), &[2u8; 5000]);
     write(&dir.path().join("big_b"), &[2u8; 5000]);
     let cancel = Cancel::default();
-    let index = scan(dir.path(), &cancel, |_, _, _| {});
+    let index = scan(dir.path(), &cancel, |_, _, _, _| {});
 
     let dupes = find_duplicates(&index, &cancel, 1000, &|_, _, _| {});
 
@@ -145,7 +145,7 @@ fn progress_is_reported_for_every_phase() {
     write(&dir.path().join("a"), b"data");
     write(&dir.path().join("b"), b"data");
     let cancel = Cancel::default();
-    let index = scan(dir.path(), &cancel, |_, _, _| {});
+    let index = scan(dir.path(), &cancel, |_, _, _, _| {});
     let seen = std::sync::Mutex::new(Vec::new());
 
     find_duplicates(&index, &cancel, 1, &|stage, done, total| {

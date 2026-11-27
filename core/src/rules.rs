@@ -79,18 +79,21 @@ impl Rules {
         let file_rules: Vec<&Rule> = self.0.iter().filter(|r| r.kind == Kind::File).collect();
         let dir_rules: Vec<&Rule> = self.0.iter().filter(|r| r.kind == Kind::Dir).collect();
 
+        let dirs = index.dir_paths();
         let mut findings = Vec::new();
         for file in &index.files {
-            let path = glob_str(&file.path);
-            if let Some(rule) = file_rules.iter().find(|r| r.matcher.is_match(&path)) {
-                if old_enough(file.modified, rule) && !is_protected(&file.path) {
-                    findings.push(finding(rule, file.path.clone(), file.size, file.modified));
+            let path = dirs[file.dir as usize].join(&*file.name);
+            let text = glob_str(&path);
+            if let Some(rule) = file_rules.iter().find(|r| r.matcher.is_match(&text)) {
+                if old_enough(file.modified, rule) && !is_protected(&path) {
+                    findings.push(finding(rule, path, file.size, file.modified));
                 }
             }
         }
 
-        let artifacts = find_artifacts(index, &dir_rules);
-        let activity = project_activity(index, &artifacts);
+        let enclosing = enclosing_artifacts(index, &dirs, &dir_rules);
+        let artifacts = find_artifacts(index, &enclosing);
+        let activity = project_activity(index, &dirs, &enclosing, &artifacts);
         for (root, a) in artifacts {
             // Active if the artifact itself or anything beside it changed recently.
             let beside = root.parent().and_then(|p| activity.get(p).copied().flatten());
@@ -102,19 +105,34 @@ impl Rules {
     }
 }
 
-/// Groups files under the outermost directory matched by a `dir` rule.
-fn find_artifacts<'a>(index: &Index, dir_rules: &[&'a Rule]) -> HashMap<PathBuf, Artifact<'a>> {
-    let mut artifacts = HashMap::new();
-    if dir_rules.is_empty() {
-        return artifacts;
+/// A directory matched by a `dir` rule, and that rule.
+type Match<'p, 'r> = Option<(&'p Path, &'r Rule)>;
+
+/// For each folder in the index, the outermost directory at or above it that a `dir` rule matches.
+fn enclosing_artifacts<'p, 'r>(index: &'p Index, dirs: &'p [PathBuf], dir_rules: &[&'r Rule]) -> Vec<Match<'p, 'r>> {
+    let matched = |dir: &'p Path| {
+        let text = glob_str(dir);
+        dir_rules.iter().find(|r| r.matcher.is_match(&text)).map(|r| (dir, *r))
+    };
+    // A scan that starts at or inside a matched directory has not seen the project around it,
+    // possibly not even the whole directory, so nothing in it can be judged inactive.
+    if index.root.ancestors().any(|dir| matched(dir).is_some()) {
+        return vec![None; dirs.len()];
     }
+    let mut enclosing = Vec::with_capacity(dirs.len());
+    enclosing.push(None);
+    for (dir, path) in index.dirs.iter().zip(dirs).skip(1) {
+        let parent = dir.parent.and_then(|p| enclosing[p as usize]);
+        enclosing.push(parent.or_else(|| matched(path)));
+    }
+    enclosing
+}
+
+/// Sums the files under each matched directory.
+fn find_artifacts<'r>(index: &Index, enclosing: &[Match<'_, 'r>]) -> HashMap<PathBuf, Artifact<'r>> {
+    let mut artifacts = HashMap::new();
     for file in &index.files {
-        let ancestors: Vec<&Path> = file.path.ancestors().skip(1).collect();
-        let hit = ancestors.iter().rev().find_map(|dir| {
-            let s = glob_str(dir);
-            dir_rules.iter().find(|r| r.matcher.is_match(&s)).map(|r| (*dir, *r))
-        });
-        if let Some((root, rule)) = hit {
+        if let Some((root, rule)) = enclosing[file.dir as usize] {
             let a = artifacts.entry(root.to_path_buf()).or_insert(Artifact { rule, size: 0, newest: None });
             a.size += file.size;
             a.newest = a.newest.max(file.modified);
@@ -124,17 +142,22 @@ fn find_artifacts<'a>(index: &Index, dir_rules: &[&'a Rule]) -> HashMap<PathBuf,
 }
 
 /// Newest change outside the artifacts, per directory that contains an artifact.
-fn project_activity(index: &Index, artifacts: &HashMap<PathBuf, Artifact>) -> HashMap<PathBuf, Option<SystemTime>> {
+fn project_activity(
+    index: &Index,
+    dirs: &[PathBuf],
+    enclosing: &[Match],
+    artifacts: &HashMap<PathBuf, Artifact>,
+) -> HashMap<PathBuf, Option<SystemTime>> {
     let mut activity: HashMap<PathBuf, Option<SystemTime>> =
         artifacts.keys().filter_map(|root| root.parent().map(|p| (p.to_path_buf(), None))).collect();
     if activity.is_empty() {
         return activity;
     }
     for file in &index.files {
-        if file.path.ancestors().any(|a| artifacts.contains_key(a)) {
+        if enclosing[file.dir as usize].is_some() {
             continue;
         }
-        for dir in file.path.ancestors().skip(1) {
+        for dir in dirs[file.dir as usize].ancestors() {
             if let Some(latest) = activity.get_mut(dir) {
                 *latest = (*latest).max(file.modified);
             }

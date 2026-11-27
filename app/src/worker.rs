@@ -118,9 +118,9 @@ fn analyze(root: &std::path::Path, cancel: &Cancel, live: &Mutex<LiveTree>, noti
     let index = scan_with_folders(
         root,
         cancel,
-        |seen, bytes, file| {
+        |seen, bytes, path, size| {
             // The window only reads this briefly, a few times a second. A panic elsewhere must not stop the scan.
-            live.lock().unwrap_or_else(|e| e.into_inner()).add(&file.path, file.size);
+            live.lock().unwrap_or_else(|e| e.into_inner()).add(path, size);
             if seen.is_multiple_of(512) {
                 notify.send(Msg::Progress(seen, bytes));
             }

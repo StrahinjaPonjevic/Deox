@@ -63,7 +63,32 @@ pub fn is_reserved_appdata_dir(name: &str) -> bool {
 
 /// Returns `true` if the path must never be offered for deletion or deleted.
 pub fn is_protected(path: &Path) -> bool {
-    let key = key_of(&resolve(path));
+    is_protected_resolved(&resolve(path))
+}
+
+/// [`is_protected`] for what a scan found. The scan follows no links, so resolving its root once
+/// settles every path below it, without a disk access for each. Deletion calls [`is_protected`]
+/// on every item again.
+pub(crate) struct ScanGuard<'a> {
+    root: &'a Path,
+    resolved: PathBuf,
+}
+
+impl<'a> ScanGuard<'a> {
+    pub(crate) fn new(root: &'a Path) -> Self {
+        ScanGuard { root, resolved: resolve(root) }
+    }
+
+    pub(crate) fn protects(&self, path: &Path) -> bool {
+        match path.strip_prefix(self.root) {
+            Ok(below) => is_protected_resolved(&self.resolved.join(below)),
+            Err(_) => is_protected(path),
+        }
+    }
+}
+
+fn is_protected_resolved(path: &Path) -> bool {
+    let key = key_of(path);
     // A bare drive or share root is `[prefix, root]`.
     if key.len() <= 2 {
         return true;

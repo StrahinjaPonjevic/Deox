@@ -1,4 +1,4 @@
-use crate::protect::is_protected;
+use crate::protect::ScanGuard;
 use crate::report::{Category, Confidence, Finding};
 use crate::scan::{is_dot_name, Cancel, FileEntry, Index, ScanError};
 use blake3::{Hash, Hasher};
@@ -26,6 +26,8 @@ pub struct DupeGroup {
 pub struct DupeFile {
     pub path: PathBuf,
     pub modified: Option<SystemTime>,
+    /// Never offered for deletion.
+    pub protected: bool,
 }
 
 #[derive(Default)]
@@ -69,7 +71,9 @@ pub fn find_duplicates(
     if cancel.is_cancelled() {
         return Duplicates { groups: Vec::new(), errors, cancelled: true };
     }
-    Duplicates { groups: full.into_iter().map(|g| group(index, g)).collect(), errors, cancelled: false }
+    let guard = ScanGuard::new(&index.root);
+    let groups = full.into_iter().map(|g| group(index, &guard, g)).collect();
+    Duplicates { groups, errors, cancelled: false }
 }
 
 /// Progress of one phase, reported every few hundred files.
@@ -100,7 +104,7 @@ impl DupeGroup {
         let kept = &self.files[0].path;
         self.files[1..]
             .iter()
-            .filter(|f| !is_protected(&f.path))
+            .filter(|f| !f.protected)
             .map(|f| Finding {
                 path: f.path.clone(),
                 size: self.size,
@@ -117,11 +121,16 @@ impl DupeGroup {
 
 /// Orders a group so the copy to keep comes first: a protected copy (it can never be
 /// deleted anyway), otherwise the oldest.
-fn group(index: &Index, files: Vec<&FileEntry>) -> DupeGroup {
+fn group(index: &Index, guard: &ScanGuard, files: Vec<&FileEntry>) -> DupeGroup {
     let size = files[0].size;
-    let mut files: Vec<DupeFile> =
-        files.into_iter().map(|f| DupeFile { path: index.file_path(f), modified: f.modified }).collect();
-    files.sort_by_cached_key(|f| (!is_protected(&f.path), f.modified, f.path.clone()));
+    let mut files: Vec<DupeFile> = files
+        .into_iter()
+        .map(|f| {
+            let path = index.file_path(f);
+            DupeFile { protected: guard.protects(&path), path, modified: f.modified }
+        })
+        .collect();
+    files.sort_by_cached_key(|f| (!f.protected, f.modified, f.path.clone()));
     DupeGroup { size, files }
 }
 

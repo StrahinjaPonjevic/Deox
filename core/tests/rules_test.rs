@@ -60,6 +60,22 @@ fn old_temp_file_is_a_safe_temp_finding() {
 }
 
 #[test]
+fn the_first_matching_rule_wins() {
+    let rule = |name: &str, glob: &str| {
+        format!(
+            "[[rule]]\nname = '{name}'\ncategory = 'Temp'\nconfidence = 'Safe'\npath_glob = '{glob}'\nreason = 'x'\n"
+        )
+    };
+    let text = [rule("narrow", r"C:\Data\*.log"), rule("wide", r"C:\Data\*"), rule("late", "**/*.log")].concat();
+    let rules = Rules::from_toml(&text).unwrap();
+    let idx = index(vec![file(r"C:\Data\a.log", 1, 1), file(r"C:\Data\b.txt", 1, 1), file(r"C:\Other\c.LOG", 1, 1)]);
+
+    let names: Vec<String> = rules.evaluate(&idx, now()).into_iter().map(|f| f.rule).collect();
+
+    assert_eq!(names, ["narrow", "wide", "late"]);
+}
+
+#[test]
 fn inactive_node_modules_is_one_review_finding() {
     let rules = Rules::builtin().unwrap();
     let idx = index(vec![

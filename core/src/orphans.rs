@@ -127,6 +127,7 @@ pub fn find_orphaned_appdata_in(
         .collect();
     let installed_dirs = collect_install_dirs(install_roots);
     let min_age = Duration::from_secs(MIN_ORPHAN_AGE_DAYS * SECS_PER_DAY);
+    let process_paths: Vec<Vec<String>> = processes.paths.iter().map(|p| key_parts(p)).collect();
 
     let mut findings = Vec::new();
     for (key, (path, size, newest)) in folders {
@@ -141,7 +142,9 @@ pub fn find_orphaned_appdata_in(
         if is_reserved_appdata_dir(name) || is_protected(path) {
             continue;
         }
-        if matches_installed(name, programs, &installed_dirs) || matches_running(name, path, processes) {
+        if matches_installed(name, programs, &installed_dirs)
+            || matches_running(name, path, &processes.names, &process_paths)
+        {
             continue;
         }
 
@@ -261,16 +264,14 @@ fn text_matches(folder_lower: &str, folder_norm: &str, text: &str) -> bool {
             })
 }
 
-fn matches_running(folder: &str, folder_path: &Path, processes: &RunningProcesses) -> bool {
+/// `process_paths` are the [`key_parts`] of the running executables.
+fn matches_running(folder: &str, folder_path: &Path, names: &HashSet<String>, process_paths: &[Vec<String>]) -> bool {
     let folder_norm = norm(folder);
-    if folder_norm.len() >= 3 && processes.names.iter().any(|n| norm(n) == folder_norm) {
+    if folder_norm.len() >= 3 && names.iter().any(|n| norm(n) == folder_norm) {
         return true;
     }
     let folder_parts = key_parts(folder_path);
-    processes.paths.iter().any(|p| {
-        let p_parts = key_parts(p);
-        p_parts.len() > folder_parts.len() && p_parts[..folder_parts.len()] == folder_parts[..]
-    })
+    process_paths.iter().any(|p| p.len() > folder_parts.len() && p[..folder_parts.len()] == folder_parts[..])
 }
 
 fn norm(s: &str) -> String {

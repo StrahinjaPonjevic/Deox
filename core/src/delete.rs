@@ -3,7 +3,7 @@
 
 use crate::protect::is_protected;
 use crate::report::{Category, Confidence, Finding};
-use crate::scan::Cancel;
+use crate::scan::{walk, Cancel};
 use anyhow::{anyhow, bail, Context, Result};
 use directories::ProjectDirs;
 use std::fs::{self, OpenOptions};
@@ -214,19 +214,11 @@ fn check(finding: &Finding, dry_run: bool) -> std::result::Result<(), Outcome> {
     Ok(())
 }
 
-/// Total size of regular files below `dir`, skipping links as the scanner does.
-/// `None` if anything cannot be read, which counts as a change.
+/// Total size of the files below `dir`, read in parallel the way the scan reads them, so links
+/// are skipped. `None` if anything cannot be read, which counts as a change.
 fn dir_size(dir: &Path) -> Option<u64> {
-    let mut total = 0;
-    for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        let kind = entry.file_type().ok()?;
-        if kind.is_symlink() {
-            continue;
-        }
-        total += if kind.is_dir() { dir_size(&entry.path())? } else { entry.metadata().ok()?.len() };
-    }
-    Some(total)
+    let everything = walk(dir, &Cancel::default(), |_, _, _, _| {}, |_| {}, |_| false);
+    everything.errors.is_empty().then(|| everything.files.iter().map(|f| f.size).sum())
 }
 
 fn open_log(path: &Path) -> Result<fs::File> {

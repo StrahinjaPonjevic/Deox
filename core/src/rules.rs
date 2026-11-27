@@ -1,8 +1,8 @@
-use crate::protect::{is_protected, resolve};
+use crate::protect::{resolve, ScanGuard};
 use crate::report::{Category, Confidence, Finding};
 use crate::scan::Index;
 use anyhow::{anyhow, Context, Result};
-use globset::{GlobBuilder, GlobMatcher};
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
@@ -44,13 +44,41 @@ struct Rule {
     name: String,
     category: Category,
     confidence: Confidence,
-    kind: Kind,
-    matcher: GlobMatcher,
     min_age: Duration,
     reason: String,
 }
 
-pub struct Rules(Vec<Rule>);
+/// Rules of one kind, matched against a path all at once. The first that matches wins.
+struct RuleSet {
+    rules: Vec<Rule>,
+    /// The glob of each rule, in the same order.
+    globs: GlobSet,
+}
+
+impl RuleSet {
+    fn new(compiled: Vec<(Rule, Glob)>) -> Result<Self> {
+        let mut globs = GlobSetBuilder::new();
+        let rules = compiled
+            .into_iter()
+            .map(|(rule, glob)| {
+                globs.add(glob);
+                rule
+            })
+            .collect();
+        Ok(RuleSet { rules, globs: globs.build().context("the rule globs cannot be combined")? })
+    }
+
+    /// `hits` is scratch space, so that matching many paths does not allocate.
+    fn first_match(&self, path: &Path, hits: &mut Vec<usize>) -> Option<&Rule> {
+        self.globs.matches_into(path, hits);
+        hits.iter().min().map(|&i| &self.rules[i])
+    }
+}
+
+pub struct Rules {
+    files: RuleSet,
+    dirs: RuleSet,
+}
 
 /// A directory matched by a `dir` rule, with what lies inside it.
 struct Artifact<'a> {
@@ -67,7 +95,16 @@ impl Rules {
 
     pub fn from_toml(text: &str) -> Result<Self> {
         let raw: RawFile = toml::from_str(text).context("invalid rules file")?;
-        raw.rule.into_iter().map(compile).collect::<Result<_>>().map(Rules)
+        let (mut files, mut dirs) = (Vec::new(), Vec::new());
+        for rule in raw.rule {
+            let kind = rule.kind;
+            let compiled = compile(rule)?;
+            match kind {
+                Kind::File => files.push(compiled),
+                Kind::Dir => dirs.push(compiled),
+            }
+        }
+        Ok(Rules { files: RuleSet::new(files)?, dirs: RuleSet::new(dirs)? })
     }
 
     /// Turns an index into findings. `now` is a parameter so age checks are testable.
@@ -76,67 +113,66 @@ impl Rules {
         let old_enough = |modified: Option<SystemTime>, rule: &Rule| {
             modified.is_some_and(|m| now.duration_since(m).unwrap_or_default() >= rule.min_age)
         };
-        let file_rules: Vec<&Rule> = self.0.iter().filter(|r| r.kind == Kind::File).collect();
-        let dir_rules: Vec<&Rule> = self.0.iter().filter(|r| r.kind == Kind::Dir).collect();
-
         let dirs = index.dir_paths();
+        let guard = ScanGuard::new(&index.root);
         let mut findings = Vec::new();
+        let (mut path, mut hits) = (PathBuf::new(), Vec::new());
         for file in &index.files {
-            let path = dirs[file.dir as usize].join(&*file.name);
-            let text = glob_str(&path);
-            if let Some(rule) = file_rules.iter().find(|r| r.matcher.is_match(&text)) {
-                if old_enough(file.modified, rule) && !is_protected(&path) {
-                    findings.push(finding(rule, path, file.size, file.modified));
+            path.clone_from(&dirs[file.dir as usize]);
+            path.push(&*file.name);
+            if let Some(rule) = self.files.first_match(&path, &mut hits) {
+                if old_enough(file.modified, rule) && !guard.protects(&path) {
+                    findings.push(finding(rule, path.clone(), file.size, file.modified));
                 }
             }
         }
 
-        let enclosing = enclosing_artifacts(index, &dirs, &dir_rules);
-        let artifacts = find_artifacts(index, &enclosing);
-        let activity = project_activity(index, &dirs, &enclosing, &artifacts);
-        for (root, a) in artifacts {
+        let enclosing = enclosing_artifacts(index, &dirs, &self.dirs);
+        let outside = newest_outside(index, &enclosing);
+        for (root, a) in find_artifacts(index, &enclosing) {
             // Active if the artifact itself or anything beside it changed recently.
-            let beside = root.parent().and_then(|p| activity.get(p).copied().flatten());
-            if old_enough(beside.max(a.newest), a.rule) && !is_protected(&root) {
-                findings.push(finding(a.rule, root, a.size, None));
+            let beside = index.dirs[root].parent.and_then(|parent| outside[parent as usize]);
+            if old_enough(beside.max(a.newest), a.rule) && !guard.protects(&dirs[root]) {
+                findings.push(finding(a.rule, dirs[root].clone(), a.size, None));
             }
         }
         findings
     }
 }
 
-/// A directory matched by a `dir` rule, and that rule.
-type Match<'p, 'r> = Option<(&'p Path, &'r Rule)>;
+/// The position of a folder matched by a `dir` rule, and that rule.
+type Match<'r> = Option<(usize, &'r Rule)>;
 
-/// For each folder in the index, the outermost directory at or above it that a `dir` rule matches.
-fn enclosing_artifacts<'p, 'r>(index: &'p Index, dirs: &'p [PathBuf], dir_rules: &[&'r Rule]) -> Vec<Match<'p, 'r>> {
-    let matched = |dir: &'p Path| {
-        let text = glob_str(dir);
-        dir_rules.iter().find(|r| r.matcher.is_match(&text)).map(|r| (dir, *r))
-    };
+/// For each folder in the index, the outermost folder at or above it that a `dir` rule matches.
+fn enclosing_artifacts<'r>(index: &Index, dirs: &[PathBuf], rules: &'r RuleSet) -> Vec<Match<'r>> {
+    let mut hits = Vec::new();
     // A scan that starts at or inside a matched directory has not seen the project around it,
     // possibly not even the whole directory, so nothing in it can be judged inactive.
-    if index.root.ancestors().any(|dir| matched(dir).is_some()) {
+    if index.root.ancestors().any(|dir| rules.first_match(dir, &mut hits).is_some()) {
         return vec![None; dirs.len()];
     }
     let in_dot_folder = index.in_dot_folder();
     let mut enclosing: Vec<Match> = Vec::with_capacity(dirs.len());
     enclosing.push(None);
-    for (dir, path) in index.dirs.iter().zip(dirs).skip(1) {
+    for (id, (dir, path)) in index.dirs.iter().zip(dirs).enumerate().skip(1) {
         let parent = dir.parent.map_or(0, |parent| parent as usize);
         // A match inside a dot folder (an editor extension's dependencies, say) is part of a tool,
         // while a dot folder that matches by itself, such as `.venv`, is a project's own.
-        enclosing.push(enclosing[parent].or_else(|| matched(path).filter(|_| !in_dot_folder[parent])));
+        let found = enclosing[parent].or_else(|| {
+            let rule = rules.first_match(path, &mut hits).filter(|_| !in_dot_folder[parent]);
+            rule.map(|rule| (id, rule))
+        });
+        enclosing.push(found);
     }
     enclosing
 }
 
-/// Sums the files under each matched directory.
-fn find_artifacts<'r>(index: &Index, enclosing: &[Match<'_, 'r>]) -> HashMap<PathBuf, Artifact<'r>> {
+/// Sums the files under each matched folder.
+fn find_artifacts<'r>(index: &Index, enclosing: &[Match<'r>]) -> HashMap<usize, Artifact<'r>> {
     let mut artifacts = HashMap::new();
     for file in &index.files {
         if let Some((root, rule)) = enclosing[file.dir as usize] {
-            let a = artifacts.entry(root.to_path_buf()).or_insert(Artifact { rule, size: 0, newest: None });
+            let a = artifacts.entry(root).or_insert(Artifact { rule, size: 0, newest: None });
             a.size += file.size;
             a.newest = a.newest.max(file.modified);
         }
@@ -144,29 +180,22 @@ fn find_artifacts<'r>(index: &Index, enclosing: &[Match<'_, 'r>]) -> HashMap<Pat
     artifacts
 }
 
-/// Newest change outside the artifacts, per directory that contains an artifact.
-fn project_activity(
-    index: &Index,
-    dirs: &[PathBuf],
-    enclosing: &[Match],
-    artifacts: &HashMap<PathBuf, Artifact>,
-) -> HashMap<PathBuf, Option<SystemTime>> {
-    let mut activity: HashMap<PathBuf, Option<SystemTime>> =
-        artifacts.keys().filter_map(|root| root.parent().map(|p| (p.to_path_buf(), None))).collect();
-    if activity.is_empty() {
-        return activity;
-    }
+/// The newest change at or below each folder, leaving out what lies in matched folders.
+fn newest_outside(index: &Index, enclosing: &[Match]) -> Vec<Option<SystemTime>> {
+    let mut newest = vec![None; index.dirs.len()];
     for file in &index.files {
-        if enclosing[file.dir as usize].is_some() {
-            continue;
-        }
-        for dir in dirs[file.dir as usize].ancestors() {
-            if let Some(latest) = activity.get_mut(dir) {
-                *latest = (*latest).max(file.modified);
-            }
+        let dir = file.dir as usize;
+        if enclosing[dir].is_none() {
+            newest[dir] = newest[dir].max(file.modified);
         }
     }
-    activity
+    // Parents come before their subfolders, so walking backwards carries each time all the way up.
+    for (id, dir) in index.dirs.iter().enumerate().rev() {
+        if let Some(parent) = dir.parent {
+            newest[parent as usize] = newest[parent as usize].max(newest[id]);
+        }
+    }
+    newest
 }
 
 fn finding(rule: &Rule, path: PathBuf, size: u64, modified: Option<SystemTime>) -> Finding {
@@ -182,25 +211,23 @@ fn finding(rule: &Rule, path: PathBuf, size: u64, modified: Option<SystemTime>) 
     }
 }
 
-fn compile(raw: RawRule) -> Result<Rule> {
+fn compile(raw: RawRule) -> Result<(Rule, Glob)> {
     let pattern = expand(&raw.path_glob).with_context(|| format!("rule '{}'", raw.name))?;
-    let matcher = GlobBuilder::new(&pattern)
+    let glob = GlobBuilder::new(&pattern)
         .case_insensitive(true)
         .build()
-        .with_context(|| format!("rule '{}': invalid path_glob '{}'", raw.name, raw.path_glob))?
-        .compile_matcher();
-    Ok(Rule {
+        .with_context(|| format!("rule '{}': invalid path_glob '{}'", raw.name, raw.path_glob))?;
+    let rule = Rule {
         name: raw.name,
         category: raw.category,
         confidence: raw.confidence,
-        kind: raw.kind,
-        matcher,
         min_age: Duration::from_secs(raw.min_age_days * SECS_PER_DAY),
         reason: raw.reason,
-    })
+    };
+    Ok((rule, glob))
 }
 
-/// Globs are matched against `/`-separated paths, so `\` in rules and paths is converted.
+/// Globs use `/` as the separator. Paths being matched are converted by the glob library itself.
 fn glob_str(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }

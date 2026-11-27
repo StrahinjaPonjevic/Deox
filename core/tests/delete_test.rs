@@ -129,6 +129,26 @@ fn folder_that_changed_since_the_scan_is_skipped() {
 }
 
 #[test]
+fn folder_that_cannot_be_read_completely_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("node_modules");
+    write(&folder.join("x.js"), b"12345");
+    let locked = folder.join("locked");
+    fs::create_dir(&locked).unwrap();
+    // Only the readable part adds up to the expected size.
+    let mut f = finding(&folder);
+    f.size = 5;
+    f.modified = None;
+    let icacls = |args: &[&str]| Command::new("icacls").arg(&locked).args(args).output().unwrap().status.success();
+    assert!(icacls(&["/deny", "*S-1-1-0:(R)"]));
+
+    let outcomes = run(&[f], true, &dir.path().join("actions.log"));
+
+    assert!(icacls(&["/remove:d", "*S-1-1-0"]));
+    assert_eq!(outcomes, vec![Outcome::Changed]);
+}
+
+#[test]
 fn protected_path_is_refused_even_when_listed() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir.path().join("placeholder"), b"x");

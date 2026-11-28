@@ -543,4 +543,80 @@ fn the_explorer_fits_the_smallest_window() {
     shot(&mut h, "explorer_smallest");
     assert!(h.get_by_label("Select Safe here").rect().max.y <= size.y, "the map's buttons stay on screen");
     assert!(h.query_by_label_contains("Cache, ").is_some(), "and some of the tree is shown");
+    assert!(h.query_by_label_contains("bin: ").is_some(), "next to the extension list");
+}
+
+/// A scan holding several file types: mkv takes the most, then zip, txt, log and no extension.
+fn types_harness(size: egui::Vec2) -> Harness<'static, DeoxApp> {
+    let mut builder = IndexBuilder::new(r"C:\Demo");
+    for (name, bytes) in [
+        ("Media/a.mkv", 9_000_000),
+        ("Media/b.mkv", 3_000_000),
+        ("Backup/c.zip", 6_000_000),
+        ("Docs/d.txt", 2_000_000),
+        ("Docs/e.log", 1_000_000),
+        ("Docs/README", 500_000),
+    ] {
+        builder.file(&Path::new(r"C:\Demo").join(name), bytes, None);
+    }
+    let index = builder.finish();
+    let tree = FolderTree::build(&index, &[]);
+    harness(size, move |app| app.set_results(Vec::new(), 6, 0, Some(Scanned { index, tree })))
+}
+
+#[test]
+fn the_extension_list_is_ordered_by_the_space_each_type_takes() {
+    let _gpu = gpu();
+    let mut h = types_harness(WIDE);
+    shot(&mut h, "explorer_types");
+    let top = |label: &str| h.get_by_label(label).rect().min.y;
+    let rows = [
+        top("mkv: 11.4 MB, 2 files"),
+        top("zip: 5.7 MB, 1 file"),
+        top("txt: 1.9 MB, 1 file"),
+        top("log: 976.6 KB, 1 file"),
+        top("(no ext): 488.3 KB, 1 file"),
+    ];
+    assert!(rows.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
+}
+
+#[test]
+fn clicking_an_extension_points_it_out_in_the_map_until_clicked_again() {
+    let _gpu = gpu();
+    let mut h = types_harness(WIDE);
+    h.run();
+    assert!(h.state().map.coloring == Coloring::FileTypes, "the map starts with a color per type");
+    h.get_by_label("Cleanup status").click();
+    h.run();
+    assert!(h.state().map.coloring == Coloring::CleanupStatus);
+
+    h.get_by_label("zip: 5.7 MB, 1 file").click();
+    shot(&mut h, "explorer_zip_pointed_out");
+    assert_eq!(h.state().file_types.highlighted.as_deref(), Some("zip"));
+    assert!(h.state().map.coloring == Coloring::FileTypes, "so that it can be seen");
+
+    h.get_by_label("zip: 5.7 MB, 1 file").click();
+    h.run();
+    assert_eq!(h.state().file_types.highlighted, None);
+}
+
+#[test]
+fn a_color_stays_with_its_extension_after_a_move() {
+    let _gpu = gpu();
+    let mut h = types_harness(WIDE);
+    h.run();
+    let colors = |app: &DeoxApp| ["mkv", "zip", "txt", "log"].map(|e| app.file_types.color(e, true));
+    let before = colors(h.state());
+    assert!(before[0] != before[1] && before[1] != before[2] && before[0] != before[2]);
+    assert!(before[..3].iter().all(Option::is_some));
+    assert_eq!(before[3], None, "the rest share the neutral color");
+    h.get_by_label("mkv: 11.4 MB, 2 files").click();
+    h.run();
+
+    h.state_mut().drop_findings(&HashSet::from([PathBuf::from(r"C:\Demo\Media")]));
+    h.run();
+
+    assert_eq!(colors(h.state()), before, "zip does not take the color of the extension that left");
+    assert_eq!(h.state().file_types.highlighted, None, "there is nothing left to point out");
+    assert!(h.query_by_label_contains("mkv: ").is_none());
 }

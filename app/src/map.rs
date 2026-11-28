@@ -1,3 +1,4 @@
+use crate::extensions::FileTypes;
 use crate::ui::{confidence_tag, human, items};
 use deox_core::report::{Confidence, Report};
 use deox_core::treemap::{layout, squarify, Cell, CellKind, FolderTree, LiveTree, Rect};
@@ -233,6 +234,14 @@ pub(crate) struct MapState {
     cache: Option<MapCache>,
     /// The cell the context menu was opened on.
     menu: Option<usize>,
+    pub(crate) coloring: Coloring,
+}
+
+/// What the colors of the map stand for.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Coloring {
+    FileTypes,
+    CleanupStatus,
 }
 
 impl Default for MapState {
@@ -246,6 +255,7 @@ impl Default for MapState {
             from: None,
             cache: None,
             menu: None,
+            coloring: Coloring::FileTypes,
         }
     }
 }
@@ -325,6 +335,35 @@ fn cell_title(tree: &FolderTree, kind: CellKind) -> String {
     }
 }
 
+/// The fill of a cell when colors stand for file types, and whether it is a type's own color
+/// (which needs its own text color).
+fn type_fill(ui: &egui::Ui, tree: &FolderTree, types: &FileTypes, kind: CellKind) -> (Color32, bool) {
+    let visuals = ui.visuals();
+    let (neutral, behind) = (visuals.widgets.inactive.bg_fill, visuals.extreme_bg_color);
+    // Everything but the pointed out extension fades towards the background.
+    let faded = |color: Color32| behind.lerp_to_gamma(color, 0.3);
+    match kind {
+        CellKind::Folder(_) => (behind, false),
+        CellKind::Rest(_) if types.highlighted.is_some() => (faded(neutral), false),
+        CellKind::Rest(_) => (neutral.gamma_multiply(0.8), false),
+        CellKind::File { folder, index } => {
+            let extension = &tree.extensions()[tree.node(folder).files[index].extension].extension;
+            let color = types.color(extension, visuals.dark_mode);
+            match &types.highlighted {
+                Some(highlighted) if highlighted == extension => (color.unwrap_or(visuals.selection.stroke.color), true),
+                Some(_) => (faded(color.unwrap_or(neutral)), false),
+                None => (color.unwrap_or(neutral), color.is_some()),
+            }
+        }
+    }
+}
+
+/// Black or white, whichever stands out more from `fill`.
+fn ink_on(fill: Color32) -> Color32 {
+    // Above this brightness the contrast with black is the higher one.
+    if egui::Rgba::from(fill).intensity() > 0.18 { Color32::BLACK } else { Color32::WHITE }
+}
+
 /// Draws the breadcrumb segments, shortening the scan root to its folder name with the full path on hover.
 fn trail_bar(ui: &mut egui::Ui, trail: &[(usize, String)], current: usize) -> Option<usize> {
     let mut open = None;
@@ -361,6 +400,7 @@ pub(crate) fn map_view(
     dark: bool,
     report: &Report,
     selected: &HashSet<usize>,
+    types: &FileTypes,
 ) -> Option<MapAction> {
     let mut action = None;
     let now = ui.input(|i| i.time);
@@ -405,6 +445,10 @@ pub(crate) fn map_view(
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(human(node.size)).size(22.0));
         ui.label(RichText::new("in this folder").weak());
+        ui.add_space(18.0);
+        ui.label(RichText::new("Colors:").weak());
+        ui.selectable_value(&mut state.coloring, Coloring::FileTypes, "File types");
+        ui.selectable_value(&mut state.coloring, Coloring::CleanupStatus, "Cleanup status");
     });
     ui.add_space(4.0);
     if node.size == 0 {
@@ -455,15 +499,22 @@ pub(crate) fn map_view(
     for (index, cell) in cache.cells.iter().enumerate() {
         let rect = screen(cell).shrink(0.5);
         let is_folder = matches!(cell.kind, CellKind::Folder(_));
-        let fill = match (cell.kind, cell.flag) {
-            (CellKind::Folder(_), Some(Confidence::Safe)) => safe_frame,
-            (CellKind::Folder(_), Some(Confidence::Review)) => review_frame,
-            (CellKind::Folder(_), _) => folder_fill,
-            (CellKind::Rest(_), _) => file_fill.gamma_multiply(0.8),
-            (_, Some(Confidence::Safe)) => safe_fill,
-            (_, Some(Confidence::Review)) => review_fill,
-            _ => file_fill,
+        let (fill, colored) = match state.coloring {
+            Coloring::FileTypes => type_fill(ui, tree, types, cell.kind),
+            Coloring::CleanupStatus => {
+                let fill = match (cell.kind, cell.flag) {
+                    (CellKind::Folder(_), Some(Confidence::Safe)) => safe_frame,
+                    (CellKind::Folder(_), Some(Confidence::Review)) => review_frame,
+                    (CellKind::Folder(_), _) => folder_fill,
+                    (CellKind::Rest(_), _) => file_fill.gamma_multiply(0.8),
+                    (_, Some(Confidence::Safe)) => safe_fill,
+                    (_, Some(Confidence::Review)) => review_fill,
+                    _ => file_fill,
+                };
+                (fill, false)
+            }
         };
+        let ink = if colored { ink_on(fill) } else { text_color };
         let radius = if rect.width() > 12.0 && rect.height() > 12.0 { 3.0 } else { 0.0 };
         painter.rect_filled(rect, radius, fill);
         if cell.header {
@@ -472,10 +523,12 @@ pub(crate) fn map_view(
         }
         if rect.width() > 60.0 && rect.height() > 22.0 && (cell.header || !is_folder) {
             let text = painter.with_clip_rect(rect);
-            text.text(rect.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, cell_title(tree, cell.kind), font.clone(), text_color);
+            text.text(rect.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, cell_title(tree, cell.kind), font.clone(), ink);
             let below = rect.height() > line * 2.0 + 10.0 && !is_folder;
             if below {
-                text.text(rect.left_top() + egui::vec2(6.0, 4.0 + line), egui::Align2::LEFT_TOP, human(cell.size), font.clone(), text_color.gamma_multiply(0.75));
+                // Faded text would lose too much contrast on a type's color.
+                let quiet = if colored { ink } else { ink.gamma_multiply(0.75) };
+                text.text(rect.left_top() + egui::vec2(6.0, 4.0 + line), egui::Align2::LEFT_TOP, human(cell.size), font.clone(), quiet);
             } else if cell.header && rect.width() > 150.0 {
                 text.text(rect.right_top() + egui::vec2(-6.0, 4.0), egui::Align2::RIGHT_TOP, human(cell.size), font.clone(), text_color.gamma_multiply(0.75));
             }

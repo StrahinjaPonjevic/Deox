@@ -15,6 +15,8 @@ const SIZE_COLUMN: f32 = 90.0;
 const SHARE_COLUMN: f32 = 120.0;
 const FILES_COLUMN: f32 = 76.0;
 const CHANGED_COLUMN: f32 = 92.0;
+/// Files and Changed are left out of a tree narrower than this, so names stay readable.
+const ALL_COLUMNS_FROM: f32 = 560.0;
 /// Horizontal offset of each level below the root.
 const INDENT: f32 = 16.0;
 
@@ -228,9 +230,11 @@ fn age(changed: Option<SystemTime>, now: SystemTime) -> String {
 }
 
 /// The left edges of the size, share, files and changed columns, and the right edge of the last.
+/// In a narrow row the last two have no width.
 fn columns(row: egui::Rect) -> [f32; 5] {
-    let changed = row.right() - CHANGED_COLUMN;
-    let files = changed - FILES_COLUMN;
+    let wide = |width: f32| if row.width() >= ALL_COLUMNS_FROM { width } else { 0.0 };
+    let changed = row.right() - wide(CHANGED_COLUMN);
+    let files = changed - wide(FILES_COLUMN);
     let share = files - SHARE_COLUMN;
     [share - SIZE_COLUMN, share, files, changed, row.right()]
 }
@@ -245,8 +249,11 @@ fn header(ui: &mut egui::Ui) {
     let color = ui.visuals().weak_text_color();
     let painter = ui.painter();
     painter.text(row.left_center() + egui::vec2(4.0, 0.0), Align2::LEFT_CENTER, "Name", font.clone(), color);
-    for (title, right) in [("Size", share), ("Files", changed), ("Changed", end)] {
-        painter.text(egui::pos2(right - 8.0, row.center().y), Align2::RIGHT_CENTER, title, font.clone(), color);
+    let wide = row.width() >= ALL_COLUMNS_FROM;
+    for (title, right, shown) in [("Size", share, true), ("Files", changed, wide), ("Changed", end, wide)] {
+        if shown {
+            painter.text(egui::pos2(right - 8.0, row.center().y), Align2::RIGHT_CENTER, title, font.clone(), color);
+        }
     }
     painter.text(egui::pos2(share + 8.0, row.center().y), Align2::LEFT_CENTER, "Share", font, color);
 }
@@ -346,11 +353,13 @@ pub(crate) fn view(ui: &mut egui::Ui, index: &Index, tree: &FolderTree, state: &
             painter.rect_filled(egui::Rect::from_min_size(bar.min, filled), 3.0, visuals.selection.stroke.color);
             let percent = format!("{:.1}%", share * 100.0);
             painter.text(egui::pos2(files_left - 4.0, middle), Align2::RIGHT_CENTER, percent, body.clone(), weak);
-            if let Some(files) = files {
-                let at = egui::pos2(changed_left - 8.0, middle);
-                painter.text(at, Align2::RIGHT_CENTER, files.to_string(), body.clone(), weak);
+            if row.width() >= ALL_COLUMNS_FROM {
+                if let Some(files) = files {
+                    let at = egui::pos2(changed_left - 8.0, middle);
+                    painter.text(at, Align2::RIGHT_CENTER, files.to_string(), body.clone(), weak);
+                }
+                painter.text(egui::pos2(end - 8.0, middle), Align2::RIGHT_CENTER, age(newest, now), body, weak);
             }
-            painter.text(egui::pos2(end - 8.0, middle), Align2::RIGHT_CENTER, age(newest, now), body, weak);
 
             // Registered after the row, so a click on the triangle is its own.
             if let Some(id) = openable {

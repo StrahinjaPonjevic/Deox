@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod extensions;
 mod map;
 mod tree;
 mod ui;
@@ -10,7 +11,8 @@ use deox_core::report::{Category, Confidence, Finding, Report};
 use deox_core::scan::Cancel;
 use deox_core::treemap::{FolderTree, LiveTree};
 use eframe::egui::{self, Color32, RichText};
-use map::{LiveMap, MapAction, MapState, Pick};
+use extensions::FileTypes;
+use map::{Coloring, LiveMap, MapAction, MapState, Pick};
 use tree::{Entry, TreeState};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -29,6 +31,8 @@ const MAX_LISTED_SKIPS: usize = 200;
 const START_COLUMN: f32 = 600.0;
 /// Height the directory tree leaves to the map and its description.
 const MAP_ROOM: f32 = 310.0;
+/// The narrowest the extension list beside the directory tree gets.
+const LIST_WIDTH: f32 = 220.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -134,6 +138,8 @@ struct DeoxApp {
     map: MapState,
     /// The directory tree above the map.
     directory: TreeState,
+    /// The colors of the extension list and the map.
+    file_types: FileTypes,
     /// Row highlighted for keyboard control, as a position in `rows`.
     cursor_row: Option<usize>,
     /// Scroll offset to apply on the next frame, set when the cursor leaves the view.
@@ -216,6 +222,7 @@ impl DeoxApp {
             tab: Tab::Explorer,
             map: MapState::default(),
             directory: TreeState::default(),
+            file_types: FileTypes::default(),
             cursor_row: None,
             scroll_to: None,
             scroll_state: (0.0, 0.0),
@@ -286,6 +293,7 @@ impl DeoxApp {
         self.selected =
             findings.iter().enumerate().filter(|(_, f)| f.confidence == Confidence::Safe).map(|(i, _)| i).collect();
         self.tab = if scanned.is_some() { Tab::Explorer } else { Tab::Cleanup };
+        self.file_types = scanned.as_ref().map(|s| FileTypes::new(&s.tree)).unwrap_or_default();
         self.results = Some(Results::new(findings, files, unreadable, scanned));
         // A long list of duplicates would push everything else off screen; the user opens it on purpose.
         self.collapsed.insert(Category::Duplicate);
@@ -416,6 +424,7 @@ impl DeoxApp {
             // the worker if the pause after a move becomes noticeable.
             index.remove(&gone.iter().map(PathBuf::as_path).collect());
             *tree = FolderTree::build(index, &findings);
+            self.file_types.tree_rebuilt(tree);
         }
         self.map.tree_rebuilt();
         self.directory.tree_rebuilt();
@@ -647,12 +656,26 @@ impl DeoxApp {
 
         let available = ui.available_height();
         let mut chosen = None;
+        let mut pointed_out = false;
         egui::Panel::top("directory_panel")
             .resizable(true)
             .default_size(available * 0.42)
             .size_range(80.0..=(available - MAP_ROOM).max(80.0))
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| chosen = tree::view(ui, index, tree, &mut self.directory));
+            .show(ui, |ui| {
+                let width = ui.available_width();
+                let gap = egui::Margin { left: 8, ..egui::Margin::ZERO };
+                egui::Panel::right("extension_panel")
+                    .resizable(true)
+                    .default_size(width * 0.3)
+                    .size_range(LIST_WIDTH..=(width * 0.45).max(LIST_WIDTH))
+                    .frame(egui::Frame::NONE.inner_margin(gap))
+                    .show(ui, |ui| pointed_out = extensions::view(ui, tree, &mut self.file_types));
+                chosen = tree::view(ui, index, tree, &mut self.directory);
+            });
+        if pointed_out {
+            self.map.coloring = Coloring::FileTypes;
+        }
         if let Some(entry) = chosen {
             let (folder, pick) = match entry {
                 Entry::Folder(id) => (id, None),
@@ -670,7 +693,7 @@ impl DeoxApp {
 
         ui.add_space(6.0);
         let dark = ui.visuals().dark_mode;
-        let action = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected);
+        let action = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected, &self.file_types);
         // The tree catches up with a click in the map on the next frame.
         self.directory.repaint_if_behind((self.map.folder, self.map.picked), ui.ctx());
         if let Some(action) = action {

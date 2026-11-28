@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
 mod extensions;
 mod map;
 mod tree;
@@ -11,8 +12,9 @@ use deox_core::report::{Category, Confidence, Finding, Report};
 use deox_core::scan::Cancel;
 use deox_core::treemap::{FolderTree, LiveTree};
 use eframe::egui::{self, Color32, RichText};
+use actions::Action;
 use extensions::FileTypes;
-use map::{Coloring, LiveMap, MapAction, MapState, Pick};
+use map::{Coloring, LiveMap, MapState, Pick};
 use tree::{Entry, TreeState};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -655,7 +657,7 @@ impl DeoxApp {
         ui.add_space(4.0);
 
         let available = ui.available_height();
-        let mut chosen = None;
+        let (mut chosen, mut menu) = (None, None);
         let mut pointed_out = false;
         egui::Panel::top("directory_panel")
             .resizable(true)
@@ -671,7 +673,7 @@ impl DeoxApp {
                     .size_range(LIST_WIDTH..=(width * 0.45).max(LIST_WIDTH))
                     .frame(egui::Frame::NONE.inner_margin(gap))
                     .show(ui, |ui| pointed_out = extensions::view(ui, tree, &mut self.file_types));
-                chosen = tree::view(ui, index, tree, &mut self.directory);
+                (chosen, menu) = tree::view(ui, index, tree, &mut self.directory);
             });
         if pointed_out {
             self.map.coloring = Coloring::FileTypes;
@@ -696,8 +698,8 @@ impl DeoxApp {
         let action = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected, &self.file_types);
         // The tree catches up with a click in the map on the next frame.
         self.directory.repaint_if_behind((self.map.folder, self.map.picked), ui.ctx());
-        if let Some(action) = action {
-            self.apply_map_action(action);
+        if let Some(action) = menu.or(action) {
+            self.apply_action(action);
         }
     }
 
@@ -804,6 +806,7 @@ impl DeoxApp {
         let mut category_select: Option<(Category, bool)> = None;
         let mut uninstall = None;
         let mut locate: Option<usize> = None;
+        let mut action = None;
         let mut clicked_row: Option<usize> = None;
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if let Some(y) = self.scroll_to.take() {
@@ -895,11 +898,24 @@ impl DeoxApp {
                         if can_locate {
                             hover.push_str("\nDouble-click to show in Disk Explorer.");
                         }
-                        if row.clicked() {
+                        if row.clicked() || row.secondary_clicked() {
                             clicked_row = Some(pos);
                         }
                         if can_locate && row.double_clicked() {
                             locate = Some(*i);
+                        }
+                        // Installed programs have no path to act on.
+                        if !full_path.is_empty() {
+                            row.context_menu(|ui| {
+                                if can_locate && ui.button("Show in Disk Explorer").clicked() {
+                                    locate = Some(*i);
+                                    ui.close();
+                                }
+                                if let Some(chosen) = actions::location_buttons(ui, &finding.path) {
+                                    action = Some(chosen);
+                                    ui.close();
+                                }
+                            });
                         }
                         let row = if can_locate { row.on_hover_cursor(egui::CursorIcon::PointingHand) } else { row };
                         row.on_hover_text(hover);
@@ -957,6 +973,9 @@ impl DeoxApp {
         }
         if let Some(finding) = locate {
             self.show_on_map(finding);
+        }
+        if let Some(action) = action {
+            self.apply_action(action);
         }
         if filter_changed {
             self.rebuild_rows();
@@ -1046,15 +1065,21 @@ impl DeoxApp {
         self.tab = Tab::Explorer;
     }
 
-    fn apply_map_action(&mut self, action: MapAction) {
+    fn apply_action(&mut self, action: Action) {
         self.ctx.request_repaint();
         match action {
-            MapAction::ShowInList(path) => {
+            Action::OpenInExplorer(path) => {
+                if let Err(e) = actions::open_in_explorer(&path) {
+                    self.error = Some(format!("Explorer could not show \"{}\": {e}", path.display()));
+                }
+            }
+            Action::CopyPath(path) => self.ctx.copy_text(path.display().to_string()),
+            Action::ShowInCleanup(path) => {
                 self.filter = path;
                 self.tab = Tab::Cleanup;
                 self.rebuild_rows();
             }
-            MapAction::SelectSafe(path) => {
+            Action::SelectSafe(path) => {
                 let Some(results) = &self.results else { return };
                 for (i, f) in results.report.findings.iter().enumerate() {
                     if f.confidence == Confidence::Safe && f.path.starts_with(&path) {
@@ -1062,7 +1087,7 @@ impl DeoxApp {
                     }
                 }
             }
-            MapAction::ClearHere(path) => {
+            Action::ClearHere(path) => {
                 let Some(results) = &self.results else { return };
                 self.selected.retain(|i| !results.report.findings.get(*i).is_some_and(|f| f.path.starts_with(&path)));
             }

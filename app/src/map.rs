@@ -1,3 +1,4 @@
+use crate::actions::{cleanup_buttons, entry_menu, location_buttons, Action};
 use crate::extensions::FileTypes;
 use crate::ui::{confidence_tag, human, items};
 use deox_core::report::{Confidence, Report};
@@ -186,16 +187,6 @@ pub(crate) fn live_map_view(ui: &mut egui::Ui, live: Option<&Arc<Mutex<LiveTree>
         *map = LiveMap { folder, ..LiveMap::default() };
         ui.ctx().request_repaint();
     }
-}
-
-/// What the user asked for in the map besides browsing it.
-pub(crate) enum MapAction {
-    /// Show the items under this folder in the Cleanup tab.
-    ShowInList(String),
-    /// Select every Safe item under this folder.
-    SelectSafe(PathBuf),
-    /// Clear the selection under this folder.
-    ClearHere(PathBuf),
 }
 
 /// What is picked in the map: a folder, one listed file, or the small files of a folder taken together.
@@ -401,7 +392,7 @@ pub(crate) fn map_view(
     report: &Report,
     selected: &HashSet<usize>,
     types: &FileTypes,
-) -> Option<MapAction> {
+) -> Option<Action> {
     let mut action = None;
     let now = ui.input(|i| i.time);
     let folder = state.folder;
@@ -566,18 +557,7 @@ pub(crate) fn map_view(
             enter = Some((target, pick, rect));
             ui.close();
         }
-        if ui.button("Show in Cleanup").clicked() {
-            action = Some(MapAction::ShowInList(cell_path(tree, kind).display().to_string()));
-            ui.close();
-        }
-        if ui.button("Select Safe here").clicked() {
-            action = Some(MapAction::SelectSafe(cell_path(tree, kind)));
-            ui.close();
-        }
-        if ui.button("Clear selection here").clicked() {
-            action = Some(MapAction::ClearHere(cell_path(tree, kind)));
-            ui.close();
-        }
+        action = entry_menu(ui, &cell_path(tree, kind)).or(action.take());
     });
     let response = match hovered {
         Some(index) => {
@@ -635,15 +615,12 @@ pub(crate) fn map_view(
     let detail = format!("{detail} {} selected.", items(here));
     ui.add(egui::Label::new(RichText::new(&detail).weak()).truncate()).on_hover_text(detail);
     ui.horizontal(|ui| {
-        if ui.button("Show in Cleanup").on_hover_text("Lists the suggested items here.").clicked() {
-            action = Some(MapAction::ShowInList(focus_path.display().to_string()));
-        }
-        if ui.button("Select Safe here").on_hover_text("Selects every Safe item here. Nothing moves until you confirm.").clicked() {
-            action = Some(MapAction::SelectSafe(focus_path.clone()));
-        }
+        action = cleanup_buttons(ui, &focus_path).or(action.take());
         if ui.add_enabled(here > 0, egui::Button::new("Clear here")).on_hover_text("Clears the selection here.").clicked() {
-            action = Some(MapAction::ClearHere(focus_path.clone()));
+            action = Some(Action::ClearHere(focus_path.clone()));
         }
+        ui.separator();
+        action = location_buttons(ui, &focus_path).or(action.take());
     });
     action
 }

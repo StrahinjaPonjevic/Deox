@@ -620,3 +620,69 @@ fn a_color_stays_with_its_extension_after_a_move() {
     assert_eq!(h.state().file_types.highlighted, None, "there is nothing left to point out");
     assert!(h.query_by_label_contains("mkv: ").is_none());
 }
+
+/// What the last frame asked to put on the clipboard.
+fn copied(h: &Harness<'_, DeoxApp>) -> Option<String> {
+    h.output().platform_output.commands.iter().find_map(|command| match command {
+        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+        _ => None,
+    })
+}
+
+/// Clicks the topmost button of that name: a context menu opens above the bar under the map.
+fn click_topmost(h: &mut Harness<'_, DeoxApp>, label: &str) {
+    h.query_all_by_label(label).min_by_key(|n| n.rect().min.y as i32).expect(label).click();
+    h.step();
+}
+
+#[test]
+fn a_right_click_in_the_tree_selects_the_entry_and_copies_its_path() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.run();
+    h.get_by_label_contains("Cache, ").click_secondary();
+    shot(&mut h, "tree_menu");
+    assert_eq!(h.state().map.folder, folder_id(h.state(), r"C:\Demo\Cache"), "the map shows it too");
+    assert_eq!(h.query_all_by_label("Open in Explorer").count(), 2, "in the menu and under the map");
+
+    click_topmost(&mut h, "Copy path");
+
+    assert_eq!(copied(&h).as_deref(), Some(r"C:\Demo\Cache"));
+    h.run();
+    assert_eq!(h.query_all_by_label("Copy path").count(), 1, "the menu closes");
+}
+
+#[test]
+fn the_buttons_under_the_map_act_on_what_it_shows() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.run();
+
+    click_topmost(&mut h, "Copy path");
+    assert_eq!(copied(&h).as_deref(), Some(r"C:\Demo"));
+
+    // The demo folders are made up, so Explorer is not started.
+    h.get_by_label("Open in Explorer").click();
+    h.run();
+    assert!(h.state().error.as_deref().is_some_and(|e| e.starts_with(r#"Explorer could not show "C:\Demo""#)));
+}
+
+#[test]
+fn a_right_click_on_a_suggestion_leads_to_its_place() {
+    let _gpu = gpu();
+    let mut h = cleanup_harness(WIDE);
+    h.run();
+    h.get_by_label("Chrome").click_secondary();
+    shot(&mut h, "cleanup_menu");
+
+    click_topmost(&mut h, "Copy path");
+    assert_eq!(copied(&h).as_deref(), Some(r"C:\Demo\Cache/Chrome"));
+
+    h.run();
+    h.get_by_label("Chrome").click_secondary();
+    h.run();
+    h.get_by_label("Show in Disk Explorer").click();
+    h.run();
+    assert!(h.state().tab == Tab::Explorer);
+    assert_eq!(h.state().directory.selected, Entry::Folder(folder_id(h.state(), r"C:\Demo\Cache\Chrome")));
+}

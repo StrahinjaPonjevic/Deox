@@ -1,6 +1,7 @@
 //! The directory tree of the explorer: every scanned folder and, inside an opened folder, every
 //! file, largest first.
 
+use crate::actions::{entry_menu, Action};
 use crate::map::Pick;
 use crate::ui::{confidence_tag, human, paint_disclosure, paint_level};
 use deox_core::report::Confidence;
@@ -258,8 +259,15 @@ fn header(ui: &mut egui::Ui) {
     painter.text(egui::pos2(share + 8.0, row.center().y), Align2::LEFT_CENTER, "Share", font, color);
 }
 
-/// Draws the tree and returns the entry the user selected in this frame.
-pub(crate) fn view(ui: &mut egui::Ui, index: &Index, tree: &FolderTree, state: &mut TreeState) -> Option<Entry> {
+/// Draws the tree. Returns the entry the user selected in this frame, and what was asked for in
+/// an entry's context menu.
+pub(crate) fn view(
+    ui: &mut egui::Ui,
+    index: &Index,
+    tree: &FolderTree,
+    state: &mut TreeState,
+) -> (Option<Entry>, Option<Action>) {
+    let mut action = None;
     if state.stale {
         state.rebuild(index, tree);
     }
@@ -376,16 +384,18 @@ pub(crate) fn view(ui: &mut egui::Ui, index: &Index, tree: &FolderTree, state: &
             if response.double_clicked() {
                 toggled = openable;
             }
-            if response.clicked() {
+            // A right click selects too, so the menu and the map are about the same entry.
+            if response.clicked() || response.secondary_clicked() {
                 state.selected = line.entry;
                 chosen = Some(line.entry);
             }
+            let path = || match line.entry {
+                Entry::Folder(id) => tree.path(id),
+                Entry::File(position) => index.file_path(&index.files[position]),
+            };
+            response.context_menu(|ui| action = entry_menu(ui, &path()).or(action.take()));
             response.on_hover_ui(|ui| {
-                let path = match line.entry {
-                    Entry::Folder(id) => tree.path(id),
-                    Entry::File(position) => index.file_path(&index.files[position]),
-                };
-                ui.label(path.display().to_string());
+                ui.label(path().display().to_string());
                 if let Some((_, _, meaning)) = level {
                     ui.label(meaning);
                 }
@@ -397,7 +407,7 @@ pub(crate) fn view(ui: &mut egui::Ui, index: &Index, tree: &FolderTree, state: &
         state.toggle(folder);
         ui.ctx().request_repaint();
     }
-    chosen
+    (chosen, action)
 }
 
 #[cfg(test)]

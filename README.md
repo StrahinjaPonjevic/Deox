@@ -4,7 +4,7 @@ Deox scans a disk or folder on Windows 11 and shows what takes space and is prob
 
 **Deox suggests, you decide.** Nothing is deleted without your confirmation, and deletion only moves items to the Recycle Bin. Everything runs locally; there is no network access and no telemetry.
 
-Results open in **Disk Explorer**, a treemap of the scanned folder: folders and files are rectangles sized by the space they take, tinted where Deox suggests removing them (Safe or Review). Click a rectangle to open its folder, or send it to the **Cleanup** tab as a filter. The Cleanup tab lists the suggestions, and its title shows how many items are selected.
+Results open in **Disk Explorer**. Above is a directory tree of every folder and file, largest first, with sizes, shares, file counts and the time of the last change; arrow keys walk it. Below is a treemap: folders and files are rectangles sized by the space they take, tinted where Deox suggests removing them (Safe or Review). Selecting in one shows the same place in the other. Click a rectangle to open its folder, or send it to the **Cleanup** tab as a filter. The Cleanup tab lists the suggestions, and its title shows how many items are selected.
 
 ## Safety levels
 

@@ -80,7 +80,11 @@ pub struct FolderTree {
     root: PathBuf,
     nodes: Vec<FolderNode>,
     extensions: Vec<ExtensionStat>,
+    file_flags: FileFlags,
 }
+
+/// Flags of single files, by folder and then by name.
+type FileFlags = HashMap<usize, HashMap<Box<OsStr>, Confidence>>;
 
 fn root_name(root: &Path) -> String {
     root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned())
@@ -121,10 +125,13 @@ impl FolderTree {
             }
         }
         // The same flags for files, found by folder and name, so no path is built per file.
-        let file_flags: HashMap<(usize, &OsStr), Confidence> = flags
-            .iter()
-            .filter_map(|(path, flag)| Some(((*ids.get(path.parent()?)?, path.file_name()?), *flag)))
-            .collect();
+        let mut file_flags: FileFlags = HashMap::new();
+        for (path, flag) in &flags {
+            let folder = path.parent().and_then(|parent| ids.get(parent));
+            if let (Some(&folder), Some(name)) = (folder, path.file_name()) {
+                file_flags.entry(folder).or_default().insert(name.into(), *flag);
+            }
+        }
 
         let mut nodes: Vec<FolderNode> = index
             .dirs
@@ -165,7 +172,7 @@ impl FolderTree {
             node.file_count += 1;
             node.newest = node.newest.max(file.modified);
             let name = file.name.to_string_lossy().into_owned();
-            let flag = file_flags.get(&(id, &*file.name)).copied();
+            let flag = file_flags.get(&id).and_then(|names| names.get(&*file.name)).copied();
             node.files.push(FileLeaf { name, size: file.size, flag, extension: kind });
             if node.files.len() >= FILES_PER_FOLDER * 2 {
                 node.files.sort_by_key(|f| std::cmp::Reverse(f.size));
@@ -224,7 +231,12 @@ impl FolderTree {
             children.sort_by_key(|c| std::cmp::Reverse(nodes[*c].size));
             nodes[i].children = children;
         }
-        FolderTree { root: index.root.clone(), nodes, extensions }
+        FolderTree { root: index.root.clone(), nodes, extensions, file_flags }
+    }
+
+    /// Set when a finding names this file itself, whether or not the file is listed in its node.
+    pub fn file_flag(&self, folder: usize, name: &OsStr) -> Option<Confidence> {
+        self.file_flags.get(&folder).and_then(|names| names.get(name)).copied()
     }
 
     /// Every extension among the files, the one taking the most space first.
@@ -298,7 +310,7 @@ pub struct LiveTree {
 impl LiveTree {
     pub fn new(root: &Path) -> LiveTree {
         let nodes = vec![FolderNode::new(root_name(root), None)];
-        let tree = FolderTree { root: root.to_path_buf(), nodes, extensions: Vec::new() };
+        let tree = FolderTree { root: root.to_path_buf(), nodes, extensions: Vec::new(), file_flags: HashMap::new() };
         let lookup = HashMap::from([(root.to_path_buf(), FolderTree::ROOT)]);
         LiveTree { tree, lookup, last: None }
     }

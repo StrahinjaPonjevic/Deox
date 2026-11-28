@@ -49,7 +49,7 @@ pub enum Msg {
     Folder(String),
     /// Items settled so far and the total, while moving to the Recycle Bin.
     Moved(usize, usize),
-    Analysis(Analysis),
+    Analysis(Box<Analysis>),
     Deleted(DeleteReport),
     Failed(String),
 }
@@ -84,7 +84,7 @@ fn run_job(notify: Notifier, job: impl FnOnce(&Notifier) + Send + 'static) {
 
 pub fn spawn_analysis(root: PathBuf, cancel: Arc<Cancel>, live: Arc<Mutex<LiveTree>>, notify: Notifier) {
     run_job(notify, move |notify| match analyze(&root, &cancel, &live, notify) {
-        Ok(analysis) => notify.send(Msg::Analysis(analysis)),
+        Ok(analysis) => notify.send(Msg::Analysis(Box::new(analysis))),
         Err(e) => notify.send(Msg::Failed(format!("The scan could not finish: {e:#}"))),
     });
 }

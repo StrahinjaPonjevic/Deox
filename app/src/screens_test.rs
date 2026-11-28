@@ -406,3 +406,141 @@ fn results_without_a_map_still_show_the_list() {
     assert!(h.query_by_label("Filter:").is_some());
     assert!(h.get_by_label("Disk Explorer").accesskit_node().is_disabled());
 }
+
+/// Names of the rows of the directory tree, top to bottom.
+fn tree_rows(app: &DeoxApp) -> Vec<String> {
+    let scanned = app.results.as_ref().unwrap().scanned.as_ref().unwrap();
+    let name = |entry| match entry {
+        Entry::Folder(id) => scanned.tree.node(id).name.clone(),
+        Entry::File(position) => scanned.index.files[position].name.to_string_lossy().into_owned(),
+    };
+    app.directory.lines.iter().map(|line| name(line.entry)).collect()
+}
+
+fn folder_id(app: &DeoxApp, path: &str) -> usize {
+    let (id, exact) = app.results.as_ref().unwrap().tree().unwrap().locate(Path::new(path));
+    assert!(exact, "{path} is a folder of the demo");
+    id
+}
+
+#[test]
+fn the_directory_tree_lists_folders_largest_first_and_every_file_of_an_opened_one() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.run();
+    assert_eq!(tree_rows(h.state()), ["Demo", "Downloads", "Cache", "Temp", "Projects"]);
+    assert!(h.query_by_label_contains("Temp, ").unwrap().accesskit_node().label().unwrap().ends_with("Safe"));
+
+    h.get_by_label("Expand Downloads").click();
+    h.run();
+    let rows = tree_rows(h.state());
+    assert_eq!(rows.len(), 45);
+    assert_eq!(rows[1..4], ["Downloads", "d39.bin", "d38.bin"]);
+
+    h.get_by_label("Collapse Downloads").click();
+    h.run();
+    assert_eq!(tree_rows(h.state()).len(), 5);
+}
+
+#[test]
+fn selecting_in_the_tree_opens_the_same_place_in_the_map() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.run();
+    h.get_by_label_contains("Cache, ").click();
+    h.run();
+    let cache = folder_id(h.state(), r"C:\Demo\Cache");
+    assert_eq!(h.state().map.folder, cache);
+    assert!(h.state().directory.selected == Entry::Folder(cache));
+
+    h.get_by_label("Expand Downloads").click();
+    h.run();
+    h.get_by_label_contains("d38.bin, ").click();
+    h.run();
+    assert_eq!(h.state().map.folder, folder_id(h.state(), r"C:\Demo\Downloads"));
+    assert!(matches!(h.state().map.picked, Some(Pick::File { index: 1, .. })), "its rectangle is pointed out");
+    assert!(matches!(h.state().directory.selected, Entry::File(_)), "the map does not take the selection back");
+}
+
+#[test]
+fn moving_in_the_map_reveals_the_place_in_the_tree_and_scrolls_to_it() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.run();
+    let downloads = folder_id(h.state(), r"C:\Demo\Downloads");
+    assert!(h.query_by_label_contains("d0.bin, ").is_none());
+
+    // The smallest file of the folder, far below the first screen of the tree.
+    h.state_mut().map.open(downloads, 0.0, None);
+    h.state_mut().map.picked = Some(Pick::File { folder: downloads, index: 39 });
+    h.run();
+
+    assert!(matches!(h.state().directory.selected, Entry::File(_)));
+    assert!(h.query_by_label_contains("d0.bin, ").is_some(), "the row is on screen");
+
+    let chrome = folder_id(h.state(), r"C:\Demo\Cache\Chrome");
+    h.state_mut().map.open(chrome, 0.0, None);
+    h.run();
+    assert!(h.state().directory.selected == Entry::Folder(chrome));
+    assert!(tree_rows(h.state()).contains(&"Chrome".to_string()), "the folders above it are opened");
+    shot(&mut h, "explorer_revealed");
+}
+
+#[test]
+fn arrow_keys_walk_the_directory_tree() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.run();
+    let press = |h: &mut Harness<'_, DeoxApp>, key| {
+        h.key_press(key);
+        h.run();
+        let state = h.state();
+        let scanned = state.results.as_ref().unwrap().scanned.as_ref().unwrap();
+        match state.directory.selected {
+            Entry::Folder(id) => scanned.tree.node(id).name.clone(),
+            Entry::File(position) => scanned.index.files[position].name.to_string_lossy().into_owned(),
+        }
+    };
+
+    assert_eq!(press(&mut h, egui::Key::ArrowDown), "Downloads");
+    assert_eq!(h.state().map.folder, folder_id(h.state(), r"C:\Demo\Downloads"), "the map follows");
+    assert_eq!(press(&mut h, egui::Key::ArrowRight), "Downloads");
+    assert_eq!(press(&mut h, egui::Key::ArrowRight), "d39.bin");
+    assert_eq!(press(&mut h, egui::Key::ArrowLeft), "Downloads");
+    assert_eq!(press(&mut h, egui::Key::ArrowLeft), "Downloads");
+    assert_eq!(tree_rows(h.state()).len(), 5, "the folder is closed again");
+    assert_eq!(press(&mut h, egui::Key::End), "Projects");
+    assert_eq!(press(&mut h, egui::Key::Home), "Demo");
+
+    h.get_by_label_contains("Cache, ").click();
+    h.run();
+    assert_eq!(press(&mut h, egui::Key::ArrowDown), "Temp", "the keys carry on from a clicked row");
+}
+
+#[test]
+fn what_was_moved_leaves_the_directory_tree() {
+    let _gpu = gpu();
+    let mut h = results_harness(WIDE);
+    h.run();
+    h.get_by_label_contains("Temp, ").click();
+    h.run();
+    h.state_mut().drop_findings(&HashSet::from([PathBuf::from(r"C:\Demo\Temp")]));
+    h.run();
+
+    assert_eq!(tree_rows(h.state()), ["Demo", "Downloads", "Cache", "Projects"]);
+
+    // The map still shows the folder that is gone; the keys keep working.
+    h.key_press(egui::Key::ArrowDown);
+    h.run();
+    assert_eq!(h.state().map.folder, folder_id(h.state(), r"C:\Demo\Downloads"));
+}
+
+#[test]
+fn the_explorer_fits_the_smallest_window() {
+    let _gpu = gpu();
+    let size = egui::vec2(780.0, 520.0);
+    let mut h = results_harness(size);
+    shot(&mut h, "explorer_smallest");
+    assert!(h.get_by_label("Select Safe here").rect().max.y <= size.y, "the map's buttons stay on screen");
+    assert!(h.query_by_label_contains("Cache, ").is_some(), "and some of the tree is shown");
+}

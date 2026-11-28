@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod map;
+mod tree;
 mod ui;
 mod worker;
 
@@ -10,6 +11,7 @@ use deox_core::scan::Cancel;
 use deox_core::treemap::{FolderTree, LiveTree};
 use eframe::egui::{self, Color32, RichText};
 use map::{LiveMap, MapAction, MapState, Pick};
+use tree::{Entry, TreeState};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -25,6 +27,8 @@ use worker::{Msg, Notifier, Scanned};
 const MAX_LISTED_SKIPS: usize = 200;
 /// Width of the centered column on the start screen.
 const START_COLUMN: f32 = 600.0;
+/// Height the directory tree leaves to the map and its description.
+const MAP_ROOM: f32 = 310.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -128,6 +132,8 @@ struct DeoxApp {
     tab: Tab,
     /// The folder shown in the map, as a node of the folder tree.
     map: MapState,
+    /// The directory tree above the map.
+    directory: TreeState,
     /// Row highlighted for keyboard control, as a position in `rows`.
     cursor_row: Option<usize>,
     /// Scroll offset to apply on the next frame, set when the cursor leaves the view.
@@ -209,6 +215,7 @@ impl DeoxApp {
             visible: Vec::new(),
             tab: Tab::Explorer,
             map: MapState::default(),
+            directory: TreeState::default(),
             cursor_row: None,
             scroll_to: None,
             scroll_state: (0.0, 0.0),
@@ -283,6 +290,7 @@ impl DeoxApp {
         // A long list of duplicates would push everything else off screen; the user opens it on purpose.
         self.collapsed.insert(Category::Duplicate);
         self.map = MapState::default();
+        self.directory = TreeState::default();
         self.reveal_start = self.ctx.input(|i| i.time);
         self.rebuild_rows();
     }
@@ -410,6 +418,7 @@ impl DeoxApp {
             *tree = FolderTree::build(index, &findings);
         }
         self.map.tree_rebuilt();
+        self.directory.tree_rebuilt();
         self.results = Some(Results::new(findings, results.files, results.unreadable, results.scanned));
         self.rebuild_rows();
     }
@@ -627,13 +636,44 @@ impl DeoxApp {
         }
     }
 
+    /// The directory tree above the map. Selecting in one shows the same place in the other.
     fn explorer_tab(&mut self, ui: &mut egui::Ui) {
         let Some(results) = &self.results else { return };
-        let Some(tree) = results.tree() else { return };
+        let Some(Scanned { index, tree }) = &results.scanned else { return };
+        // Whatever moved the map (a click in it, its buttons, a double-click in Cleanup), the tree follows.
+        self.directory.follow((self.map.folder, self.map.picked), index, tree);
         scan_notes(ui, results);
         ui.add_space(4.0);
+
+        let available = ui.available_height();
+        let mut chosen = None;
+        egui::Panel::top("directory_panel")
+            .resizable(true)
+            .default_size(available * 0.42)
+            .size_range(80.0..=(available - MAP_ROOM).max(80.0))
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| chosen = tree::view(ui, index, tree, &mut self.directory));
+        if let Some(entry) = chosen {
+            let (folder, pick) = match entry {
+                Entry::Folder(id) => (id, None),
+                Entry::File(position) => {
+                    let file = &index.files[position];
+                    let folder = file.dir as usize;
+                    let listed = tree.file_index(folder, &file.name);
+                    (folder, Some(listed.map_or(Pick::Rest(folder), |index| Pick::File { folder, index })))
+                }
+            };
+            self.map.open(folder, ui.input(|i| i.time), None);
+            self.map.picked = pick;
+            self.directory.moved_map((folder, pick));
+        }
+
+        ui.add_space(6.0);
         let dark = ui.visuals().dark_mode;
-        if let Some(action) = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected) {
+        let action = map::map_view(ui, tree, &mut self.map, dark, &results.report, &self.selected);
+        // The tree catches up with a click in the map on the next frame.
+        self.directory.repaint_if_behind((self.map.folder, self.map.picked), ui.ctx());
+        if let Some(action) = action {
             self.apply_map_action(action);
         }
     }

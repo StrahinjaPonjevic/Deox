@@ -151,7 +151,12 @@ pub(crate) fn share_bar(ui: &mut egui::Ui, part: u64, whole: u64) {
 /// Marks a safety level by shape as well as color: solid for Safe, hatched for Review, outlined for Info.
 pub(crate) fn level_glyph(ui: &mut egui::Ui, level: Confidence, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-    let painter = ui.painter().with_clip_rect(rect);
+    paint_level(ui.painter(), rect, level, color);
+}
+
+/// The mark of [`level_glyph`], drawn into a given square.
+pub(crate) fn paint_level(painter: &egui::Painter, rect: egui::Rect, level: Confidence, color: Color32) {
+    let painter = painter.with_clip_rect(rect);
     match level {
         Confidence::Safe => {
             painter.rect_filled(rect, 2.0, color);
@@ -181,15 +186,19 @@ pub(crate) fn cell(ui: &mut egui::Ui, width: f32, layout: egui::Layout, add: imp
 /// A small triangle that points right when the group is collapsed and down when it is open.
 pub(crate) fn disclosure_icon(ui: &mut egui::Ui, open: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-    let c = rect.center();
+    paint_disclosure(ui.painter(), rect.center(), open, ui.visuals().text_color());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Expand or collapse group"));
+    response
+}
+
+/// The triangle of [`disclosure_icon`], centred on `c`.
+pub(crate) fn paint_disclosure(painter: &egui::Painter, c: egui::Pos2, open: bool, color: Color32) {
     let points = if open {
         vec![c + egui::vec2(-5.0, -3.0), c + egui::vec2(5.0, -3.0), c + egui::vec2(0.0, 4.0)]
     } else {
         vec![c + egui::vec2(-3.0, -5.0), c + egui::vec2(-3.0, 5.0), c + egui::vec2(4.0, 0.0)]
     };
-    ui.painter().add(egui::Shape::convex_polygon(points, ui.visuals().text_color(), egui::Stroke::NONE));
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Expand or collapse group"));
-    response
+    painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
 }
 
 /// The three safety levels in one always-visible line, so the colours and shapes are never a guess.
